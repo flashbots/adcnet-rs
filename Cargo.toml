@@ -2,8 +2,16 @@
 name = "adcnet"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.79"
 license = "MIT"
 description = "Auction-based anonymous broadcast DC net."
+authors = ["Flashbots"]
+# repository/homepage omitted while github.com/flashbots/adcnet-rs is private —
+# add them once the repo is public (a private URL 404s on the crates.io page).
+documentation = "https://docs.rs/adcnet"
+readme = "README.md"
+keywords = ["anonymity", "dc-net", "anonymous-broadcast", "privacy", "cryptography"]
+categories = ["cryptography", "network-programming"]
 # benches/netsim.rs is a module shared by the declared bench targets, not a
 # bench itself — keep auto-discovery off.
 autobenches = false
