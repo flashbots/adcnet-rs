@@ -1,0 +1,58 @@
+[package]
+name = "adcnet"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Auction-based anonymous broadcast DC net."
+# benches/netsim.rs is a module shared by the declared bench targets, not a
+# bench itself — keep auto-discovery off.
+autobenches = false
+
+[dependencies]
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+p256 = { version = "0.13", features = ["ecdh"] }
+aes = "0.8"
+aes-gcm = "0.10"
+ctr = "0.9"
+sha2 = "0.10"
+sha3 = "0.10"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_bytes = "0.11"
+bincode = "1.3"
+blake3 = "1"
+rayon = { version = "1", optional = true }
+thiserror = "1"
+rand = "0.8"
+rand_core = "0.6"
+hex = "0.4"
+once_cell = "1"
+
+[features]
+default = []
+parallel = ["dep:rayon"]
+
+[dev-dependencies]
+hex-literal = "0.4"
+rand_chacha = "0.3"
+
+[[bench]]
+name = "protocol"
+harness = false
+
+[[bench]]
+name = "one_round"
+harness = false
+
+[profile.bench]
+debug = false
+lto = "thin"
+
+[profile.profiling]
+inherits = "release"
+debug = true
+strip = false
+
+[[example]]
+name = "profile"
+path = "examples/profile.rs"
