@@ -46,9 +46,28 @@ mod netsim;
 
 // Topology assumed for the e2e extrapolation.
 const S: usize = 4;
-const N_PER_AGG: usize = 25;
-const AGG: usize = 4;
-const N: usize = N_PER_AGG * AGG;
+const N: usize = 100;
+// The aggregator count trades per-aggregator load (∝ N/AGG) against combiner
+// fan-in (∝ AGG); both carry the same per-item wire cost, so N/AGG + AGG is
+// minimized at AGG = √N. Derive it rather than hardcoding so the n-agg row
+// always reports the model-optimal operating point.
+const AGG: usize = round_sqrt(N);
+const N_PER_AGG: usize = N.div_ceil(AGG);
+
+/// Nearest integer to √n. `usize::isqrt` lands in 1.84 and const float math is
+/// unstable, so spell out the integer version (const-fn loops are fine ≥1.46).
+const fn round_sqrt(n: usize) -> usize {
+    let mut r = 0;
+    while (r + 1) * (r + 1) <= n {
+        r += 1;
+    }
+    // r = ⌊√n⌋; round up when r+1 is the closer integer.
+    if n - r * r > (r + 1) * (r + 1) - n {
+        r + 1
+    } else {
+        r
+    }
+}
 
 #[derive(Clone, Copy)]
 struct Scenario {
@@ -56,11 +75,10 @@ struct Scenario {
     payload_bytes: usize,
 }
 
-const SCENARIOS: &[Scenario] = &[
-    Scenario { label: "256B-payload", payload_bytes: 256 },
-    Scenario { label: "1KB-payload", payload_bytes: 1024 },
-    Scenario { label: "4KB-payload", payload_bytes: 4096 },
-];
+const SCENARIOS: &[Scenario] = &[Scenario {
+    label: "4KB-payload",
+    payload_bytes: 4096,
+}];
 
 fn time<F: FnMut()>(iters: usize, mut f: F) -> Duration {
     f(); // 1 warmup, not counted
@@ -252,10 +270,14 @@ fn stage_combine_and_decode(
     clients: &[Signed<ClientContribution>],
     servers: &[Signed<ServerShare>],
 ) -> Duration {
-    let clients_raw: Vec<ClientContribution> =
-        clients.iter().map(|s| s.recover().unwrap().0.clone()).collect();
-    let servers_raw: Vec<ServerShare> =
-        servers.iter().map(|s| s.recover().unwrap().0.clone()).collect();
+    let clients_raw: Vec<ClientContribution> = clients
+        .iter()
+        .map(|s| s.recover().unwrap().0.clone())
+        .collect();
+    let servers_raw: Vec<ServerShare> = servers
+        .iter()
+        .map(|s| s.recover().unwrap().0.clone())
+        .collect();
     time(5, || {
         let _ = combine_round(&b.cfg, 1, &clients_raw, &servers_raw, S).unwrap();
     })
@@ -295,12 +317,20 @@ fn run_scenario(sc: Scenario) -> (StageTimes, Wires) {
 
     // Sanity: a full round must actually decode all N payloads. Catches
     // regressions where the IBLT is mis-sized for the load factor.
-    let clients_raw: Vec<ClientContribution> =
-        clients.iter().map(|s| s.recover().unwrap().0.clone()).collect();
-    let servers_raw: Vec<ServerShare> =
-        servers.iter().map(|s| s.recover().unwrap().0.clone()).collect();
+    let clients_raw: Vec<ClientContribution> = clients
+        .iter()
+        .map(|s| s.recover().unwrap().0.clone())
+        .collect();
+    let servers_raw: Vec<ServerShare> = servers
+        .iter()
+        .map(|s| s.recover().unwrap().0.clone())
+        .collect();
     let decoded = combine_round(&b.cfg, 1, &clients_raw, &servers_raw, S).unwrap();
-    assert_eq!(decoded.len(), N, "decoded set must match all client payloads");
+    assert_eq!(
+        decoded.len(),
+        N,
+        "decoded set must match all client payloads"
+    );
 
     let a = stage_client_contribute(&b);
     let bsh = stage_server_share(&b);
@@ -313,7 +343,9 @@ fn run_scenario(sc: Scenario) -> (StageTimes, Wires) {
     println!("  C₁  aggregate N={:>3} clients          {}", N, fmt(c_all));
     println!(
         "  C₄  aggregate N/{}={:>3} clients/agg     {}",
-        AGG, N_PER_AGG, fmt(c_bucket)
+        AGG,
+        N_PER_AGG,
+        fmt(c_bucket)
     );
     println!("  D   combine S={} + decode IBLT         {}", S, fmt(d));
     let wires = Wires {
@@ -340,7 +372,7 @@ fn extrapolate(sc: Scenario, st: &StageTimes) {
     let c_all = st.c_aggregate_all;
     let c_bucket = st.c_aggregate_bucket;
     let d = st.d_combine_decode;
-    let payload_mib = (sc.payload_bytes * N) as f64 / 1048576.0;
+    let useful_b = (sc.payload_bytes * N) as f64;
 
     println!("\n── {} e2e (S={}, N={}) ──", sc.label, S, N);
     println!("  per-stage wall clock:");
@@ -353,7 +385,10 @@ fn extrapolate(sc: Scenario, st: &StageTimes) {
     println!("    C₁ aggregate N={:>3} clients     {}", N, fmt(c_all));
     println!(
         "    C₄ aggregate N/{}={:>3}/agg       {}  (each of {} aggregators, parallel)",
-        AGG, N_PER_AGG, fmt(c_bucket), AGG,
+        AGG,
+        N_PER_AGG,
+        fmt(c_bucket),
+        AGG,
     );
     println!("    D combine + IBLT decode        {}", fmt(d));
 
@@ -362,28 +397,22 @@ fn extrapolate(sc: Scenario, st: &StageTimes) {
         let bottleneck_name = pipe.iter().max_by_key(|(_, x)| *x).unwrap().0;
         println!();
         println!("  {}", name);
-        println!("    one-shot latency        {}   ({})", fmt(latency), latency_desc);
+        println!(
+            "    one-shot latency        {}   ({})",
+            fmt(latency),
+            latency_desc
+        );
         println!(
             "    pipelined bottleneck    {}   ({})",
             fmt(bottleneck),
             bottleneck_name
         );
         println!(
-            "    pipelined throughput    {:>8.2} MiB/s  ({:>6.1} Mb/s)  — {} payloads/round",
-            payload_mib / bottleneck.as_secs_f64(),
-            payload_mib * 8.0 / bottleneck.as_secs_f64(),
+            "    pipelined throughput    {:>7.2} MB/s  — {} payloads/round",
+            useful_b / bottleneck.as_secs_f64() / 1e6,
             N
         );
     };
-
-    // ---- 1 aggregator + S server boxes + combiner --------------------------
-    // Pipeline:  client(A) → aggregator(C₁) → servers(B, parallel) → combiner(D)
-    report(
-        "WITH 1 aggregator (separate aggregator + S server boxes + combiner)",
-        "A + C₁ + B + D",
-        a + c_all + bsh + d,
-        &[("client", a), ("aggregator", c_all), ("server", bsh), ("combiner", d)],
-    );
 
     // ---- AGG aggregators + S server boxes + combiner -----------------------
     // Pipeline:  client(A) → aggregators(C₄, parallel) → servers(B, parallel)
@@ -391,7 +420,10 @@ fn extrapolate(sc: Scenario, st: &StageTimes) {
     // Combiner additionally folds AGG partial aggregates into one before
     // decoding — that fold is ~AGG/N × C₁ ≪ D and is absorbed into D's stage.
     report(
-        &format!("WITH {} aggregators ({} clients/agg, parallel)", AGG, N_PER_AGG),
+        &format!(
+            "WITH {} aggregators ({} clients/agg, parallel)",
+            AGG, N_PER_AGG
+        ),
         "A + C₄ + B + D",
         a + c_bucket + bsh + d,
         &[
@@ -425,10 +457,12 @@ fn extrapolate(sc: Scenario, st: &StageTimes) {
 fn network_extrapolate(sc: Scenario, st: &StageTimes, w: &Wires) {
     let a = st.a_client;
     let bsh = st.b_server_share;
-    let payload_mib = (sc.payload_bytes * N) as f64 / 1048576.0;
     let mut rng = ChaCha20Rng::from_seed([0x5E; 32]);
 
-    println!("\n── {} network sim (S={}, N={}, {} aggs) ──", sc.label, S, N, AGG);
+    println!(
+        "\n── {} network sim (S={}, N={}, {} aggs) ──",
+        sc.label, S, N, AGG
+    );
     println!(
         "  wire: contribution {}, server share {}, aggregate {}, decoded set {}",
         netsim::fmt_bytes(w.contrib_b),
@@ -436,69 +470,93 @@ fn network_extrapolate(sc: Scenario, st: &StageTimes, w: &Wires) {
         netsim::fmt_bytes(w.agg_b),
         netsim::fmt_bytes(w.result_b),
     );
-    println!("  net = P1 client upload + P2 fan-in to combiner + P3 result broadcast");
+    println!("  net = P1 client upload + P2 fan-in to combiner + P3 result broadcast; e2e = cpu + net");
+
+    // Wire ledger + summary (per round). Useful = the recovered multiset;
+    // efficiency = useful / total bytes crossing every link.
+    let useful_b = w.result_b;
+    let client_up = N as f64 * w.contrib_b;
+    let server_shares = S as f64 * w.share_b;
+    let agg_fwd = AGG as f64 * w.agg_b;
+    let broadcast = N as f64 * w.result_b;
+    let wire_total = client_up + server_shares + agg_fwd + broadcast;
+    println!(
+        "  useful {} / round   wire {} / round   efficiency {:.3e}",
+        netsim::fmt_bytes(useful_b),
+        netsim::fmt_bytes(wire_total),
+        useful_b / wire_total,
+    );
+    println!(
+        "    contribution {} (N·contrib) + shares {} (S·share) + aggregate {} (AGG·agg) + broadcast {} (N·result)",
+        netsim::fmt_bytes(client_up),
+        netsim::fmt_bytes(server_shares),
+        netsim::fmt_bytes(agg_fwd),
+        netsim::fmt_bytes(broadcast),
+    );
+    println!("  per-role wire (out = emitted / in = ingested):");
+    println!(
+        "    1 client:     out {} (→ aggregator; 0-agg ×{}S)   in {} (broadcast)",
+        netsim::fmt_bytes(w.contrib_b),
+        S,
+        netsim::fmt_bytes(w.result_b),
+    );
+    println!(
+        "    1 server:     out {} (share → combiner)",
+        netsim::fmt_bytes(w.share_b),
+    );
+    println!(
+        "    1 aggregator: in {} ({} posts)   out {} (1 aggregate)",
+        netsim::fmt_bytes(N_PER_AGG as f64 * w.contrib_b),
+        N_PER_AGG,
+        netsim::fmt_bytes(w.agg_b),
+    );
+    println!(
+        "    combiner:     in {} (AGG·agg + S·share)   out {} (N·result broadcast)",
+        netsim::fmt_bytes(agg_fwd + server_shares),
+        netsim::fmt_bytes(broadcast),
+    );
+    println!(
+        "    0-agg server: in {} (all N posts + {} peer shares)",
+        netsim::fmt_bytes(client_up + (S - 1) as f64 * w.share_b),
+        S - 1,
+    );
 
     for p in netsim::NETWORKS {
         println!("  {}:", p.header());
 
         // P3 is topology-independent.
         let p3 = p.maxlat(&mut rng, N)
-            + p
-                .xfer_server(N as f64 * w.result_b) // combiner uplink, N copies
+            + p.xfer_server(N as f64 * w.result_b) // combiner uplink, N copies
                 .max(p.xfer_client(w.result_b)); // each client's downlink
 
-        let report =
-            |name: &str, p1: Duration, p2: Duration, latency: Duration, pipe: &[(&str, Duration)]| {
-                let net = p1 + p2 + p3;
-                let e2e = latency + net;
-                let mut all: Vec<(&str, Duration)> = pipe.to_vec();
-                all.extend_from_slice(&[("net P1", p1), ("net P2", p2), ("net P3", p3)]);
-                let (bn_name, bn) = *all.iter().max_by_key(|(_, x)| *x).unwrap();
-                println!(
-                    "    {:<6} net {} [P1 {} + P2 {} + P3 {}]  e2e {}  pipe {} ({}) → {:>7.2} MiB/s",
-                    name,
-                    fmt(net),
-                    fmt(p1),
-                    fmt(p2),
-                    fmt(p3),
-                    fmt(e2e),
-                    fmt(bn),
-                    bn_name,
-                    payload_mib / bn.as_secs_f64(),
-                );
-            };
-
-        // 1 aggregator: clients → aggregator → (aggregate ‖ shares) → combiner.
-        let p1 = p.maxlat(&mut rng, N)
-            + p
-                .xfer_client(w.contrib_b)
-                .max(p.xfer_server(N as f64 * w.contrib_b));
-        let p2 = (p.maxlat(&mut rng, 1) + p.xfer_server(w.agg_b)).max(
-            p.maxlat(&mut rng, S)
-                + p.xfer_server(w.share_b).max(p.xfer_server(S as f64 * w.share_b)),
-        );
-        report(
-            "1-agg",
-            p1,
-            p2,
-            a + st.c_aggregate_all + bsh + st.d_combine_decode,
-            &[
-                ("client", a),
-                ("aggregator", st.c_aggregate_all),
-                ("server", bsh),
-                ("combiner", st.d_combine_decode),
-            ],
-        );
+        // Throughput is pipelined (rounds overlap), so it is gated by the
+        // slowest stage, not the sequential e2e sum; e2e is one-round latency.
+        let report = |name: &str, p1: Duration, p2: Duration, cpu: Duration, pipe: &[(&str, Duration)]| {
+            let net = p1 + p2 + p3;
+            let e2e = cpu + net;
+            let (bn_name, bn) = *pipe.iter().max_by_key(|(_, x)| *x).unwrap();
+            println!(
+                "    {:<6} net {} [P1 {} + P2 {} + P3 {}]  e2e {}  →  {:>7.2} MB/s pipelined (bottleneck {})",
+                name,
+                fmt(net),
+                fmt(p1),
+                fmt(p2),
+                fmt(p3),
+                fmt(e2e),
+                useful_b / bn.as_secs_f64() / 1e6,
+                bn_name,
+            );
+        };
 
         // AGG aggregators: each ingests N/AGG contributions; combiner ingests
         // AGG partial aggregates alongside the S shares.
         let p1 = p.maxlat(&mut rng, N)
-            + p
-                .xfer_client(w.contrib_b)
+            + p.xfer_client(w.contrib_b)
                 .max(p.xfer_server((N / AGG) as f64 * w.contrib_b));
         let p2 = (p.maxlat(&mut rng, AGG) + p.xfer_server(AGG as f64 * w.agg_b)).max(
             p.maxlat(&mut rng, S)
-                + p.xfer_server(w.share_b).max(p.xfer_server(S as f64 * w.share_b)),
+                + p.xfer_server(w.share_b)
+                    .max(p.xfer_server(S as f64 * w.share_b)),
         );
         report(
             "n-agg",
@@ -510,6 +568,9 @@ fn network_extrapolate(sc: Scenario, st: &StageTimes, w: &Wires) {
                 ("aggregator", st.c_aggregate_bucket),
                 ("server", bsh),
                 ("combiner", st.d_combine_decode),
+                ("P1", p1),
+                ("P2", p2),
+                ("P3", p3),
             ],
         );
 
@@ -517,8 +578,7 @@ fn network_extrapolate(sc: Scenario, st: &StageTimes, w: &Wires) {
         // ingests all N; servers exchange shares all-to-all before each
         // decodes locally.
         let p1 = p.maxlat(&mut rng, N)
-            + p
-                .xfer_client(S as f64 * w.contrib_b)
+            + p.xfer_client(S as f64 * w.contrib_b)
                 .max(p.xfer_server(N as f64 * w.contrib_b));
         let p2 = p.maxlat(&mut rng, S) + p.xfer_server((S - 1) as f64 * w.share_b);
         let per_server = bsh + st.c_aggregate_all + st.d_combine_decode;
@@ -527,7 +587,13 @@ fn network_extrapolate(sc: Scenario, st: &StageTimes, w: &Wires) {
             p1,
             p2,
             a + per_server,
-            &[("client", a), ("server", per_server)],
+            &[
+                ("client", a),
+                ("server", per_server),
+                ("P1", p1),
+                ("P2", p2),
+                ("P3", p3),
+            ],
         );
     }
 }
@@ -536,7 +602,10 @@ fn main() {
     println!("ADCNet 1-round (IBLT-message) per-stage benchmark");
     println!("topology assumed for extrapolation: S={S} servers, N={N} clients");
     #[cfg(feature = "parallel")]
-    println!("parallel feature: ON  (rayon threads = {})", rayon::current_num_threads());
+    println!(
+        "parallel feature: ON  (rayon threads = {})",
+        rayon::current_num_threads()
+    );
     #[cfg(not(feature = "parallel"))]
     println!("parallel feature: OFF (single-threaded)");
 

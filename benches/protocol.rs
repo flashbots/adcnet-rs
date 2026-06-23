@@ -50,7 +50,24 @@ mod netsim;
 
 // Topology assumed for the e2e extrapolation.
 const S: usize = 4;
-const N: usize = 100;
+const N: usize = 200;
+// n-agg uses AGG aggregators, each ingesting N/AGG clients. Balancing per-agg
+// load (∝ N/AGG) against combiner fan-in (∝ AGG) minimizes at AGG = √N.
+const AGG: usize = round_sqrt(N);
+const N_PER_AGG: usize = N.div_ceil(AGG);
+
+/// Nearest integer to √n (usize::isqrt is 1.84+, const float math is unstable).
+const fn round_sqrt(n: usize) -> usize {
+    let mut r = 0;
+    while (r + 1) * (r + 1) <= n {
+        r += 1;
+    }
+    if n - r * r > (r + 1) * (r + 1) - n {
+        r + 1
+    } else {
+        r
+    }
+}
 
 #[derive(Clone, Copy)]
 struct Scenario {
@@ -168,10 +185,15 @@ fn setup(sc: Scenario) -> BenchSetup {
 
 // ---- stage A: client blind+sign --------------------------------------------
 fn stage_client_blind(b: &BenchSetup) -> Duration {
-    let cm = ClientMessager { config: &b.config, shared_secrets: &b.client_secrets[0] };
+    let cm = ClientMessager {
+        config: &b.config,
+        shared_secrets: &b.client_secrets[0],
+    };
     let priv0 = &b.client_priv[0];
     time(10, || {
-        let (msg, _) = cm.prepare_message(2, &b.prev_bc, &b.prev_msg, None).unwrap();
+        let (msg, _) = cm
+            .prepare_message(2, &b.prev_bc, &b.prev_msg, None)
+            .unwrap();
         let _signed = Signed::new(priv0, msg).unwrap();
     })
 }
@@ -180,8 +202,15 @@ fn stage_client_blind(b: &BenchSetup) -> Duration {
 fn signed_batch(b: &BenchSetup) -> Vec<Signed<adcnet::protocol::messages::ClientRoundMessage>> {
     (0..N)
         .map(|c| {
-            let prev = if c == 0 { &b.prev_msg } else { &b.prev_msg[..1.min(b.prev_msg.len())] };
-            let cm = ClientMessager { config: &b.config, shared_secrets: &b.client_secrets[c] };
+            let prev = if c == 0 {
+                &b.prev_msg
+            } else {
+                &b.prev_msg[..1.min(b.prev_msg.len())]
+            };
+            let cm = ClientMessager {
+                config: &b.config,
+                shared_secrets: &b.client_secrets[c],
+            };
             let (raw, _) = cm.prepare_message(2, &b.prev_bc, prev, None).unwrap();
             Signed::new(&b.client_priv[c], raw).unwrap()
         })
@@ -195,7 +224,10 @@ fn signed_batch(b: &BenchSetup) -> Vec<Signed<adcnet::protocol::messages::Client
 // disabled mode). With `parallel` enabled, the per-message verify dominates
 // and parallelizes via rayon; the field/XOR merge stays sequential to preserve
 // commutative-add into a single owned aggregate.
-fn stage_batch_aggregate(_b: &BenchSetup, batch: &[Signed<adcnet::protocol::messages::ClientRoundMessage>]) -> Duration {
+fn stage_batch_aggregate(
+    _b: &BenchSetup,
+    batch: &[Signed<adcnet::protocol::messages::ClientRoundMessage>],
+) -> Duration {
     let auction_len = batch[0].object.auction_vector.len();
     let msg_len = batch[0].object.message_vector.len();
     let server_ids = batch[0].object.all_server_ids.clone();
@@ -250,7 +282,10 @@ fn stage_batch_aggregate(_b: &BenchSetup, batch: &[Signed<adcnet::protocol::mess
 //
 // This is the per-server cost in production; with `parallel` enabled, pad
 // derivation across the N users runs on rayon threads.
-fn stage_batch_unblind(b: &BenchSetup, batch: &[Signed<adcnet::protocol::messages::ClientRoundMessage>]) -> Duration {
+fn stage_batch_unblind(
+    b: &BenchSetup,
+    batch: &[Signed<adcnet::protocol::messages::ClientRoundMessage>],
+) -> Duration {
     // Build a realistic aggregate of N users with non-zero pads.
     let auction_len = batch[0].object.auction_vector.len();
     let msg_len = batch[0].object.message_vector.len();
@@ -280,7 +315,10 @@ fn stage_batch_unblind(b: &BenchSetup, batch: &[Signed<adcnet::protocol::message
 }
 
 // ---- stage D: leader combines S partials -----------------------------------
-fn stage_leader_combine(b: &BenchSetup, batch: &[Signed<adcnet::protocol::messages::ClientRoundMessage>]) -> Duration {
+fn stage_leader_combine(
+    b: &BenchSetup,
+    batch: &[Signed<adcnet::protocol::messages::ClientRoundMessage>],
+) -> Duration {
     let auction_len = batch[0].object.auction_vector.len();
     let msg_len = batch[0].object.message_vector.len();
     let mut agg = AggregatedClientMessages {
@@ -322,6 +360,8 @@ fn stage_leader_combine(b: &BenchSetup, batch: &[Signed<adcnet::protocol::messag
 struct StageTimes {
     a_client_blind: Duration,
     b_batch_aggregate: Duration,
+    /// B over a per-aggregator bucket of N/AGG clients (n-agg).
+    b_batch_aggregate_bucket: Duration,
     c_batch_unblind: Duration,
     d_leader_combine: Duration,
 }
@@ -379,40 +419,67 @@ fn measure_wires(
 }
 
 fn run_scenario(sc: Scenario) -> (StageTimes, Wires) {
-    println!("\n── {} (auction_slots={}, message_bytes={}) ──",
-             sc.label, sc.auction_slots, sc.message_bytes);
+    println!(
+        "\n── {} (auction_slots={}, message_bytes={}) ──",
+        sc.label, sc.auction_slots, sc.message_bytes
+    );
     let b = setup(sc);
     let batch = signed_batch(&b);
     let a = stage_client_blind(&b);
     let b_agg = stage_batch_aggregate(&b, &batch);
+    let b_bucket = stage_batch_aggregate(&b, &batch[..N_PER_AGG.min(batch.len())]);
     let c = stage_batch_unblind(&b, &batch);
     let d = stage_leader_combine(&b, &batch);
-    println!("  A   one client blind+sign           {}", fmt(a));
-    println!("  B   aggregate N={:>3} client msgs    {}", N, fmt(b_agg));
-    println!("  C   unblind aggregate (N={:>3})      {}", N, fmt(c));
-    println!("  D   leader combine S={} partials     {}", S, fmt(d));
+    println!("  A    one client blind+sign           {}", fmt(a));
+    println!("  B₁   aggregate N={:>3} client msgs    {}", N, fmt(b_agg));
+    println!(
+        "  B_n  aggregate N/{}={:>3} clients/agg   {}",
+        AGG, N_PER_AGG, fmt(b_bucket)
+    );
+    println!("  C    unblind aggregate (N={:>3})      {}", N, fmt(c));
+    println!("  D    leader combine S={} partials     {}", S, fmt(d));
     let w = measure_wires(&b, &batch);
-    (StageTimes { a_client_blind: a, b_batch_aggregate: b_agg, c_batch_unblind: c, d_leader_combine: d }, w)
+    (
+        StageTimes {
+            a_client_blind: a,
+            b_batch_aggregate: b_agg,
+            b_batch_aggregate_bucket: b_bucket,
+            c_batch_unblind: c,
+            d_leader_combine: d,
+        },
+        w,
+    )
 }
 
 fn extrapolate(label: &str, sc: Scenario, st: &StageTimes) {
     let a = st.a_client_blind;
     let b = st.b_batch_aggregate;
+    let b_bucket = st.b_batch_aggregate_bucket;
     let c = st.c_batch_unblind;
     let d = st.d_leader_combine;
 
-    // Disabled: each server independently runs B (aggregate N msgs) + C (unblind N users).
+    // 0-agg: each server independently runs B (aggregate N msgs) + C (unblind N users).
     // Servers run in parallel across boxes — per-server wall clock = B + C.
     let disabled_per_server = b + c;
     let disabled_latency = a + disabled_per_server + d;
     // Pipelined: each box keeps doing its job; bottleneck = max over actor wall clocks.
-    let disabled_pipe = [("client", a), ("server", disabled_per_server), ("leader", d)];
+    let disabled_pipe = [
+        ("client", a),
+        ("server", disabled_per_server),
+        ("leader", d),
+    ];
     let disabled_max = disabled_pipe.iter().map(|(_, x)| *x).max().unwrap();
     let disabled_max_name = disabled_pipe.iter().max_by_key(|(_, x)| *x).unwrap().0;
 
-    // Enabled: client → aggregator (B) → servers (C, parallel across S boxes) → leader (D).
-    let enabled_latency = a + b + c + d;
-    let enabled_pipe = [("client", a), ("aggregator", b), ("server", c), ("leader", d)];
+    // n-agg: client → AGG aggregators (each B over N/AGG) → servers (C, parallel
+    // across S boxes) → leader (D).
+    let enabled_latency = a + b_bucket + c + d;
+    let enabled_pipe = [
+        ("client", a),
+        ("aggregator", b_bucket),
+        ("server", c),
+        ("leader", d),
+    ];
     let enabled_max = enabled_pipe.iter().map(|(_, x)| *x).max().unwrap();
     let enabled_max_name = enabled_pipe.iter().max_by_key(|(_, x)| *x).unwrap().0;
 
@@ -423,111 +490,231 @@ fn extrapolate(label: &str, sc: Scenario, st: &StageTimes) {
     println!("    server unblind    {}", fmt(c));
     println!("    leader combine    {}", fmt(d));
     println!();
-    let payload_mib = sc.payload_bytes as f64 / 1048576.0;
-    println!("  DISABLED aggregation");
-    println!("    one-shot latency       {}   (A + B + C + D, server does B+C)", fmt(disabled_latency));
-    println!("    pipelined bottleneck   {}   ({})", fmt(disabled_max), disabled_max_name);
-    println!("    pipelined throughput   {:>8.2} MiB/s  ({:>6.1} Mb/s)",
-             payload_mib / disabled_max.as_secs_f64(),
-             payload_mib * 8.0 / disabled_max.as_secs_f64());
+    let payload_b = sc.payload_bytes as f64;
+    println!("  0-agg (no aggregator; each server runs B+C)");
+    println!(
+        "    one-shot latency       {}   (A + B + C + D, server does B+C)",
+        fmt(disabled_latency)
+    );
+    println!(
+        "    pipelined bottleneck   {}   ({})",
+        fmt(disabled_max),
+        disabled_max_name
+    );
+    println!(
+        "    pipelined throughput   {:>7.2} MB/s",
+        payload_b / disabled_max.as_secs_f64() / 1e6
+    );
     println!();
-    println!("  ENABLED aggregation (1 aggregator, S servers)");
-    println!("    one-shot latency       {}   (A + B + C + D, B on aggregator)", fmt(enabled_latency));
-    println!("    pipelined bottleneck   {}   ({})", fmt(enabled_max), enabled_max_name);
-    println!("    pipelined throughput   {:>8.2} MiB/s  ({:>6.1} Mb/s)",
-             payload_mib / enabled_max.as_secs_f64(),
-             payload_mib * 8.0 / enabled_max.as_secs_f64());
+    println!("  n-agg (1 aggregator, S servers)");
+    println!(
+        "    one-shot latency       {}   (A + B + C + D, B on aggregator)",
+        fmt(enabled_latency)
+    );
+    println!(
+        "    pipelined bottleneck   {}   ({})",
+        fmt(enabled_max),
+        enabled_max_name
+    );
+    println!(
+        "    pipelined throughput   {:>7.2} MB/s",
+        payload_b / enabled_max.as_secs_f64() / 1e6
+    );
+}
+
+/// Combined per-round link load: client→server flows (msg/agg/partial) carry
+/// both the auction vector and the payload, so they sum. The broadcast back to
+/// all clients carries only the scheduling (auction) result that drives the
+/// next round — the recovered message is the delivered output, not re-pushed to
+/// every client — so bc_b is the scheduling broadcast alone.
+fn combined_wires(sched: &Wires, msg: &Wires) -> Wires {
+    Wires {
+        msg_b: sched.msg_b + msg.msg_b,
+        agg_b: sched.agg_b + msg.agg_b,
+        part_b: sched.part_b + msg.part_b,
+        bc_b: sched.bc_b,
+    }
+}
+
+/// Per-round CPU: one round does the auction field work and the messaging
+/// crypto, so each stage's cost is the sum across both scenarios.
+fn combined_stages(sched: &StageTimes, msg: &StageTimes) -> StageTimes {
+    StageTimes {
+        a_client_blind: sched.a_client_blind + msg.a_client_blind,
+        b_batch_aggregate: sched.b_batch_aggregate + msg.b_batch_aggregate,
+        b_batch_aggregate_bucket: sched.b_batch_aggregate_bucket
+            + msg.b_batch_aggregate_bucket,
+        c_batch_unblind: sched.c_batch_unblind + msg.c_batch_unblind,
+        d_leader_combine: sched.d_leader_combine + msg.d_leader_combine,
+    }
 }
 
 /// e2e extrapolation including the simulated network. Wire phases per round
 /// (sequential; each gated by both ends of its flows):
-///   P1   client upload — disabled mode: each client uplink carries S copies
-///        and every server ingests N messages; enabled mode: one copy to the
-///        aggregator, which ingests N.
-///   P1b  (enabled only) aggregator fans the aggregate out to S servers.
+///   P1   client upload — 0-agg: each client uplink carries S copies and every
+///        server ingests N messages; n-agg: one copy to an aggregator, each of
+///        the AGG aggregators ingesting N/AGG.
+///   P1b  (n-agg only) a combiner gathers the AGG partial aggregates and fans
+///        the full aggregate out to S servers.
 ///   P2   servers → leader: S partial decryptions onto the leader's downlink.
 ///   P3   leader → clients: the RoundBroadcast, N copies up, one per client
 ///        downlink.
-fn network_extrapolate(label: &str, st: &StageTimes, w: &Wires) {
+fn network_extrapolate(st: &StageTimes, w: &Wires) {
     let a = st.a_client_blind;
     let b = st.b_batch_aggregate;
+    let b_bucket = st.b_batch_aggregate_bucket;
     let c = st.c_batch_unblind;
     let d = st.d_leader_combine;
-    // Round payload on the wire is the broadcast everyone ends up with.
-    let payload_mib = w.bc_b / 1048576.0;
     let mut rng = ChaCha20Rng::from_seed([0x5E; 32]);
 
-    println!("\n── {} network sim (S={}, N={}) ──", label, S, N);
+    println!("\n── network sim (S={}, N={}) ──", S, N);
     println!(
-        "  wire: client msg {}, aggregate {}, partial {}, broadcast {}",
+        "  wire (auction+payload, shared link): client msg {}, aggregate {}, partial {}, broadcast {}",
         netsim::fmt_bytes(w.msg_b),
         netsim::fmt_bytes(w.agg_b),
         netsim::fmt_bytes(w.part_b),
         netsim::fmt_bytes(w.bc_b),
     );
-    println!("  net = P1 client upload (+P1b agg fan-out) + P2 partials to leader + P3 broadcast");
+    println!("  net = P1 client upload (+P1b agg fan-out) + P2 partials to leader + P3 broadcast; e2e = cpu + net");
+
+    // Wire ledger + summary (per round); efficiency = useful / total bytes
+    // crossing every link. Useful = the delivered anonymous message; the
+    // broadcast (w.bc_b) carries only the scheduling result.
+    let useful_b = MESSAGING.message_bytes as f64;
+    let partials = S as f64 * w.part_b;
+    let broadcast = N as f64 * w.bc_b;
+    let client_up_disabled = (N * S) as f64 * w.msg_b;
+    let client_up_enabled = N as f64 * w.msg_b;
+    let agg_gather = AGG as f64 * w.agg_b;
+    let fan_out = S as f64 * w.agg_b;
+    let wire_disabled = client_up_disabled + partials + broadcast;
+    let wire_enabled = client_up_enabled + agg_gather + fan_out + partials + broadcast;
+    println!("  useful {} / round", netsim::fmt_bytes(useful_b));
+    println!(
+        "    0-agg            wire {} / round  efficiency {:.3e}   [client→S {} (N·S·msg) + partials {} (S·part) + broadcast {} (N·bc)]",
+        netsim::fmt_bytes(wire_disabled),
+        useful_b / wire_disabled,
+        netsim::fmt_bytes(client_up_disabled),
+        netsim::fmt_bytes(partials),
+        netsim::fmt_bytes(broadcast),
+    );
+    println!(
+        "    n-agg (AGG={:>2})    wire {} / round  efficiency {:.3e}   [client→agg {} (N·msg) + gather {} (AGG·agg) + fan-out {} (S·agg) + partials {} (S·part) + broadcast {} (N·bc)]",
+        AGG,
+        netsim::fmt_bytes(wire_enabled),
+        useful_b / wire_enabled,
+        netsim::fmt_bytes(client_up_enabled),
+        netsim::fmt_bytes(agg_gather),
+        netsim::fmt_bytes(fan_out),
+        netsim::fmt_bytes(partials),
+        netsim::fmt_bytes(broadcast),
+    );
+    println!("  per-role wire (out = emitted / in = ingested):");
+    println!(
+        "    1 client:     out {} (0-agg ×{}S to all servers)   in {} (broadcast)",
+        netsim::fmt_bytes(w.msg_b),
+        S,
+        netsim::fmt_bytes(w.bc_b),
+    );
+    println!(
+        "    1 server:     in {} 0-agg (N·msg) / {} n-agg (1 aggregate)   out {} (partial → leader)",
+        netsim::fmt_bytes(N as f64 * w.msg_b),
+        netsim::fmt_bytes(w.agg_b),
+        netsim::fmt_bytes(w.part_b),
+    );
+    println!(
+        "    1 aggregator: in {} (N/{}={} posts, n-agg)   out {} (1 partial → combiner)",
+        netsim::fmt_bytes(N_PER_AGG as f64 * w.msg_b),
+        AGG,
+        N_PER_AGG,
+        netsim::fmt_bytes(w.agg_b),
+    );
+    println!(
+        "    combiner:     in {} (AGG·agg gather)   out {} (S·agg fan-out to servers)",
+        netsim::fmt_bytes(agg_gather),
+        netsim::fmt_bytes(fan_out),
+    );
+    println!(
+        "    leader:       in {} (S·part)   out {} (N·bc broadcast)",
+        netsim::fmt_bytes(partials),
+        netsim::fmt_bytes(broadcast),
+    );
 
     for p in netsim::NETWORKS {
         println!("  {}:", p.header());
 
         // Mode-independent phases.
         let p2 = p.maxlat(&mut rng, S)
-            + p.xfer_server(w.part_b).max(p.xfer_server(S as f64 * w.part_b));
-        let p3 = p.maxlat(&mut rng, N)
-            + p.xfer_server(N as f64 * w.bc_b).max(p.xfer_client(w.bc_b));
+            + p.xfer_server(w.part_b)
+                .max(p.xfer_server(S as f64 * w.part_b));
+        let p3 =
+            p.maxlat(&mut rng, N) + p.xfer_server(N as f64 * w.bc_b).max(p.xfer_client(w.bc_b));
 
-        let report =
-            |name: &str, net: Duration, latency: Duration, pipe: &[(&str, Duration)]| {
-                let e2e = latency + net;
-                let (bn_name, bn) = *pipe.iter().max_by_key(|(_, x)| *x).unwrap();
-                println!(
-                    "    {:<9} net {}  e2e {}  pipe {} ({}) → {:>7.2} MiB/s",
-                    name,
-                    fmt(net),
-                    fmt(e2e),
-                    fmt(bn),
-                    bn_name,
-                    payload_mib / bn.as_secs_f64(),
-                );
-            };
+        // Throughput is pipelined: consecutive rounds overlap (round r's
+        // broadcast P3 runs while round r+1 uploads P1, auction alongside
+        // messaging), so steady-state is gated by the slowest stage, not the
+        // sequential e2e sum. e2e is reported as the one-round latency.
+        let report = |name: &str, phases: String, net: Duration, cpu: Duration, pipe: &[(&str, Duration)]| {
+            let e2e = cpu + net;
+            let (bn_name, bn) = *pipe.iter().max_by_key(|(_, x)| *x).unwrap();
+            println!(
+                "    {:<8} net {} [{}]  e2e {}  →  {:>7.2} MB/s pipelined (bottleneck {})",
+                name,
+                fmt(net),
+                phases,
+                fmt(e2e),
+                useful_b / bn.as_secs_f64() / 1e6,
+                bn_name,
+            );
+        };
 
-        // DISABLED: clients send to all S servers; each server runs B+C.
+        // 0-agg: clients send to all S servers; each server runs B+C.
         let p1 = p.maxlat(&mut rng, N)
-            + p
-                .xfer_client(S as f64 * w.msg_b)
+            + p.xfer_client(S as f64 * w.msg_b)
                 .max(p.xfer_server(N as f64 * w.msg_b));
         report(
-            "DISABLED",
+            "0-agg",
+            format!("P1 {} + P2 {} + P3 {}", fmt(p1), fmt(p2), fmt(p3)),
             p1 + p2 + p3,
             a + (b + c) + d,
             &[
                 ("client", a),
                 ("server", b + c),
                 ("leader", d),
-                ("net P1", p1),
-                ("net P2", p2),
-                ("net P3", p3),
+                ("P1", p1),
+                ("P2", p2),
+                ("P3", p3),
             ],
         );
 
-        // ENABLED: clients send once to the aggregator, which fans out.
+        // n-agg: AGG aggregators each ingest N/AGG; a combiner gathers the AGG
+        // partials and fans the full aggregate to S servers.
         let p1 = p.maxlat(&mut rng, N)
-            + p.xfer_client(w.msg_b).max(p.xfer_server(N as f64 * w.msg_b));
-        let p1b = p.maxlat(&mut rng, S)
-            + p.xfer_server(S as f64 * w.agg_b).max(p.xfer_server(w.agg_b));
+            + p.xfer_client(w.msg_b)
+                .max(p.xfer_server(N_PER_AGG as f64 * w.msg_b));
+        let p1b = p.maxlat(&mut rng, AGG.max(S))
+            + p.xfer_server(AGG as f64 * w.agg_b)
+                .max(p.xfer_server(S as f64 * w.agg_b));
         report(
-            "ENABLED",
+            "n-agg",
+            format!(
+                "P1 {} + P1b {} + P2 {} + P3 {}",
+                fmt(p1),
+                fmt(p1b),
+                fmt(p2),
+                fmt(p3)
+            ),
             p1 + p1b + p2 + p3,
-            a + b + c + d,
+            a + b_bucket + c + d,
             &[
                 ("client", a),
-                ("aggregator", b),
+                ("aggregator", b_bucket),
                 ("server", c),
                 ("leader", d),
-                ("net P1", p1),
-                ("net P1b", p1b),
-                ("net P2", p2),
-                ("net P3", p3),
+                ("P1", p1),
+                ("P1b", p1b),
+                ("P2", p2),
+                ("P3", p3),
             ],
         );
     }
@@ -537,7 +724,10 @@ fn main() {
     println!("ADCNet per-stage benchmark");
     println!("topology assumed for extrapolation: S={S} servers, N={N} clients");
     #[cfg(feature = "parallel")]
-    println!("parallel feature: ON  (rayon threads = {})", rayon::current_num_threads());
+    println!(
+        "parallel feature: ON  (rayon threads = {})",
+        rayon::current_num_threads()
+    );
     #[cfg(not(feature = "parallel"))]
     println!("parallel feature: OFF (single-threaded)");
 
@@ -545,7 +735,9 @@ fn main() {
     let (st_msg, w_msg) = run_scenario(MESSAGING);
 
     extrapolate("SCHEDULING", SCHEDULING, &st_sched);
-    extrapolate("MESSAGING",  MESSAGING,  &st_msg);
-    network_extrapolate("SCHEDULING", &st_sched, &w_sched);
-    network_extrapolate("MESSAGING", &st_msg, &w_msg);
+    extrapolate("MESSAGING", MESSAGING, &st_msg);
+    network_extrapolate(
+        &combined_stages(&st_sched, &st_msg),
+        &combined_wires(&w_sched, &w_msg),
+    );
 }

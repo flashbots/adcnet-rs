@@ -27,7 +27,6 @@ pub struct NetProfile {
 pub const NETWORKS: &[NetProfile] = &[
     NetProfile { label: "LAN  ", lat_ms: 0.5, jitter_ms: 0.2, client_mbps: 1000.0, server_mbps: 1000.0 },
     NetProfile { label: "fiber", lat_ms: 25.0, jitter_ms: 10.0, client_mbps: 100.0, server_mbps: 1000.0 },
-    NetProfile { label: "dsl  ", lat_ms: 35.0, jitter_ms: 15.0, client_mbps: 20.0, server_mbps: 1000.0 },
 ];
 
 impl NetProfile {
