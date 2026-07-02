@@ -22,8 +22,6 @@ pub enum ProtocolError {
     WrongRound { got: i64, expected: i64 },
     #[error("message for invalid server {0:?}")]
     InvalidServer(ServerId),
-    #[error("unauthorized client {0}")]
-    Unauthorized(String),
     #[error("no shared key with user {0}")]
     NoSharedKey(String),
     #[error("client not yet initialized")]
@@ -42,6 +40,8 @@ pub enum ProtocolError {
     EmptyPartials,
     #[error("two partials carry the same server_id {0:?}")]
     DuplicatePartial(ServerId),
+    #[error("duplicate submission from signer {0}")]
+    DuplicateSubmission(String),
     #[error("partial-decryption inputs disagree on the original aggregate")]
     MismatchingAggregate,
     #[error("signed message claims server_id {claimed:?} but signer is unknown / wrong pubkey")]
@@ -66,6 +66,7 @@ impl ProtocolError {
 /// vector as raw bytes (`8 · N` LE). Pub so session-level wire types can
 /// reuse it.
 pub mod u64_vec_bytes {
+    use crate::crypto::fields::P;
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
     // `&Vec<u64>` (not `&[u64]`) is required by serde's `with` field binding.
@@ -86,7 +87,11 @@ pub mod u64_vec_bytes {
         let mut out = Vec::with_capacity(buf.len() / 8);
         for chunk in buf.chunks_exact(8) {
             let arr: [u8; 8] = chunk.try_into().unwrap();
-            out.push(u64::from_le_bytes(arr));
+            let x = u64::from_le_bytes(arr);
+            if x >= P {
+                return Err(serde::de::Error::custom("non-canonical field element"));
+            }
+            out.push(x);
         }
         Ok(out)
     }
@@ -192,6 +197,16 @@ impl AggregatedClientMessages {
         }
         if self.message_vector.is_empty() {
             self.message_vector = vec![0u8; o.message_vector.len()];
+        }
+        if self.auction_vector.len() != o.auction_vector.len()
+            || self.message_vector.len() != o.message_vector.len()
+        {
+            return Err(ProtocolError::MismatchingVectorLengths);
+        }
+
+        let existing: std::collections::HashSet<&PublicKey> = self.user_pks.iter().collect();
+        if let Some(dup) = o.user_pks.iter().find(|pk| existing.contains(pk)) {
+            return Err(ProtocolError::DuplicateSubmission(dup.to_hex()));
         }
 
         add_mod_slice(&mut self.auction_vector, &o.auction_vector);

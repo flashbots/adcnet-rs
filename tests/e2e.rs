@@ -122,12 +122,24 @@ fn e2e_three_clients_three_servers_via_aggregator() {
         message_vector: Vec::new(),
     };
 
-    // Each client prepares a round-2 message.
+    // Each client prepares a round-2 message, also bidding into round 2's
+    // auction. Clients 0 and 1 bid identical content: with a deterministic
+    // per-round/content IBLT key the two bids would collide and the
+    // round-2 auction vector would fail to recover.
+    let identical_bid_msg = vec![9u8; 40];
+    let mut cur_rng = ChaCha20Rng::from_seed([9; 32]);
     let mut client_msgs: Vec<Signed<adcnet::protocol::messages::ClientRoundMessage>> = Vec::new();
     let mut talking = 0;
     for c in 0..3 {
         let cm = ClientMessager { config: &config, shared_secrets: &client_secrets[c] };
-        let (msg, won) = cm.prepare_message(2, &prev_bc, &msgs_data[c], None).unwrap();
+        let bid = if c < 2 {
+            AuctionData::from_message(&identical_bid_msg, 10)
+        } else {
+            AuctionData::from_message(&msgs_data[c], 10)
+        };
+        let (msg, won) = cm
+            .prepare_message(2, &prev_bc, &msgs_data[c], Some(&bid), &mut cur_rng)
+            .unwrap();
         if won {
             talking += 1;
         }
@@ -136,12 +148,49 @@ fn e2e_three_clients_three_servers_via_aggregator() {
     }
     assert_eq!(talking, 2);
 
-    // Aggregator combines them.
+    // Aggregator combines them. A replayed copy of client 0's message is
+    // folded into the same batch: the duplicate signer is skipped, not
+    // erred, so the aggregate and downstream assertions stay unaffected.
     let agg = AggregatorMessager { config: &config };
-    let verified = VerifyClientMessages::verify(&client_msgs).unwrap();
+    let mut replayed_msgs = client_msgs.clone();
+    replayed_msgs.push(client_msgs[0].clone());
+    let mut verified = VerifyClientMessages::verify(&replayed_msgs).unwrap();
+    let client0 = verified[0].clone();
+    // A stale previous-round message in the batch is skipped, not a batch
+    // error — and, placed first, must not shadow the signer's valid message.
+    let mut stale = verified[1].clone();
+    stale.message.round_number = 1;
+    verified.insert(0, stale);
+    // A wrong-length auction vector is likewise skipped, not truncated-folded.
+    let mut short = verified[1].clone();
+    short.message.auction_vector.truncate(short.message.auction_vector.len() - 1);
+    verified.insert(0, short);
+    // A non-canonical field element must not survive wire decode.
+    let mut noncanonical = client0.message.clone();
+    noncanonical.auction_vector[0] = adcnet::crypto::P;
+    let bytes = bincode::serialize(&noncanonical).unwrap();
+    bincode::deserialize::<adcnet::protocol::messages::ClientRoundMessage>(&bytes).unwrap_err();
     let aggregated = agg
         .aggregate_verified_messages(2, None, &verified, &client_pubkeys)
         .unwrap();
+    assert_eq!(aggregated.user_pks.len(), 3, "replayed signer must not double-count");
+
+    // Cross-call replay: re-submitting client 0's already-folded message as a
+    // fresh batch against `previous = Some(&aggregated)` is also a no-op.
+    let idempotent = agg
+        .aggregate_verified_messages(2, Some(&aggregated), std::slice::from_ref(&client0), &client_pubkeys)
+        .unwrap();
+    assert_eq!(idempotent.user_pks, aggregated.user_pks);
+    assert_eq!(idempotent.auction_vector, aggregated.auction_vector);
+    assert_eq!(idempotent.message_vector, aggregated.message_vector);
+
+    // Backstop: unioning an aggregate with itself must be rejected, not
+    // silently double-added.
+    let err = aggregated.clone().union_inplace(&aggregated).unwrap_err();
+    assert!(
+        matches!(err, adcnet::protocol::messages::ProtocolError::DuplicateSubmission(_)),
+        "got {err:?}"
+    );
 
     // Each server computes its partial decryption.
     let mut partials = Vec::new();
@@ -161,6 +210,9 @@ fn e2e_three_clients_three_servers_via_aggregator() {
         shared_secrets: &servers_secrets[0],
     };
     let bc = final_msger.unblind_partial_messages(&mut partials).unwrap();
+
+    // All 3 round-2 bids (including the two identical ones) must decode.
+    assert_eq!(bc.auction_vector.recover().unwrap().len(), 3);
 
     // The two winning messages must appear somewhere in the message vector.
     let mut found = 0;
@@ -189,12 +241,20 @@ fn e2e_disabled_aggregation_via_server_service() {
     // 3 servers — full ServerService instances using real ECDH this time.
     let mut servers: Vec<ServerService> = Vec::new();
     let mut server_pubs: Vec<(ServerId, adcnet::crypto::ExchangePublicKey)> = Vec::new();
+    let mut server_signing_pubs: Vec<(ServerId, adcnet::crypto::PublicKey)> = Vec::new();
     for s in 0..3 {
-        let (_pk, sk) = generate_keypair();
+        let (pk, sk) = generate_keypair();
         let xk = ExchangePrivateKey::generate();
         let sid = ServerId((s + 1) as u32);
         server_pubs.push((sid, xk.public()));
+        server_signing_pubs.push((sid, pk));
         servers.push(ServerService::new(config.clone(), sid, sk, xk));
+    }
+    // Cross-register peer signing pubkeys so the trusted server set is known.
+    for srv in servers.iter() {
+        for (sid, pk) in &server_signing_pubs {
+            srv.register_peer_server(*sid, pk.clone());
+        }
     }
     for s in servers.iter() {
         s.advance_to_round(Round::new(2, RoundContext::Client));
@@ -254,7 +314,9 @@ fn e2e_disabled_aggregation_via_server_service() {
     let mut signed_msgs = Vec::new();
     for c in 0..3 {
         let cm = ClientMessager { config: &config, shared_secrets: &client_secrets[c] };
-        let (msg, _won) = cm.prepare_message(2, &prev_bc, &msgs_data[c], None).unwrap();
+        let (msg, _won) = cm
+            .prepare_message(2, &prev_bc, &msgs_data[c], None, &mut prev_rng)
+            .unwrap();
         let signed = Signed::new(&client_keys[c], msg).unwrap();
         signed_msgs.push(signed);
     }
@@ -265,6 +327,14 @@ fn e2e_disabled_aggregation_via_server_service() {
             server.process_client_message(signed).unwrap();
         }
     }
+
+    // Replaying client 0's message into a server that already folded it
+    // must be rejected, not silently double-folded or self-cancelled.
+    let err = servers[0].process_client_message(&signed_msgs[0]).unwrap_err();
+    assert!(
+        matches!(err, adcnet::protocol::messages::ProtocolError::DuplicateSubmission(_)),
+        "got {err:?}"
+    );
 
     // Each server finalizes its partial over its accumulated direct aggregate.
     let mut partials = Vec::new();

@@ -144,6 +144,12 @@ pub fn combine_round(
             got: servers.len(),
         });
     }
+    let mut seen = std::collections::HashSet::with_capacity(servers.len());
+    for s in servers {
+        if !seen.insert(s.server_id) {
+            return Err(crate::protocol::messages::ProtocolError::DuplicatePartial(s.server_id).into());
+        }
+    }
     for c in clients {
         if c.round != round {
             return Err(OneRoundError::WrongRound {
@@ -298,5 +304,17 @@ mod tests {
         let cfg = config(64, 4);
         let err = combine_round(&cfg, 0, &[], &[], 2).unwrap_err();
         assert!(matches!(err, OneRoundError::ServerShareCount { .. }));
+
+        // Right count, but one server_id duplicated (and another missing)
+        // must not be silently treated as full coverage.
+        let dup = ServerShare { server_id: ServerId(1), round: 0, share: vec![0u64; 4] };
+        let err = combine_round(&cfg, 0, &[], &[dup.clone(), dup], 2).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                OneRoundError::Protocol(crate::protocol::messages::ProtocolError::DuplicatePartial(_))
+            ),
+            "got {err:?}"
+        );
     }
 }

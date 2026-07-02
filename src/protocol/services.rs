@@ -13,7 +13,8 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-use crate::auction::auction::AuctionData;
+use crate::auction::auction::{AuctionData, AUCTION_BID_XI};
+use crate::auction::iblt::iblt_field_element_count;
 use crate::crypto::fields::add_mod_slice;
 use crate::crypto::{xor_inplace, ExchangePrivateKey, ExchangePublicKey, PrivateKey, PublicKey, ServerId, SharedKey};
 
@@ -145,6 +146,11 @@ impl ServerService {
         if raw.round_number != cur {
             return Err(ProtocolError::WrongRound { got: raw.round_number, expected: cur });
         }
+        if raw.auction_vector.len()
+            != iblt_field_element_count(self.config.auction_slots, AUCTION_BID_XI)
+        {
+            return Err(ProtocolError::MismatchingVectorLengths);
+        }
 
         // Lazy-init the aggregate's owned buffers on the first message.
         let agg = rd.direct_aggregate.get_or_insert_with(|| AggregatedClientMessages {
@@ -162,6 +168,9 @@ impl ServerService {
             || agg.auction_vector.len() != raw.auction_vector.len()
         {
             return Err(ProtocolError::MismatchingVectorLengths);
+        }
+        if agg.user_pks.contains(&signer) {
+            return Err(ProtocolError::DuplicateSubmission(signer.to_hex()));
         }
 
         // Fold directly: SIMD field-add auction, AVX2-XOR message, push signer.
@@ -197,6 +206,11 @@ impl ServerService {
         if msg.round_number != cur {
             return Err(ProtocolError::WrongRound { got: msg.round_number, expected: cur });
         }
+        if msg.auction_vector.len()
+            != iblt_field_element_count(self.config.auction_slots, AUCTION_BID_XI)
+        {
+            return Err(ProtocolError::MismatchingVectorLengths);
+        }
 
         let shared = self.shared_secrets.lock().unwrap();
         let messager = ServerMessager {
@@ -214,10 +228,11 @@ impl ServerService {
                 rd.own_partial = Some(additional.clone());
             }
             Some(current) => {
+                // Gate on the duplicate check before any mutation.
+                current.original_aggregate.union_inplace(msg)?;
                 current.user_pks.extend(additional.user_pks.iter().cloned());
                 add_mod_slice(&mut current.auction_vector, &additional.auction_vector);
                 xor_inplace(&mut current.message_vector, &additional.message_vector);
-                current.original_aggregate.union_inplace(msg)?;
             }
         }
         // Note: do *not* insert into `rd.partials` here — the leader's own
@@ -274,6 +289,18 @@ impl ServerService {
         &self,
         msg: ServerPartialDecryptionMessage,
     ) -> Result<Option<RoundBroadcast>, ProtocolError> {
+        if !self.peer_pubkeys.lock().unwrap().contains_key(&msg.server_id) {
+            return Err(ProtocolError::UnknownPeerServer(msg.server_id));
+        }
+        // Threshold comes from our own registry, never the message's own claim.
+        let expected: std::collections::HashSet<ServerId> =
+            self.peer_pubkeys.lock().unwrap().keys().copied().collect();
+        let claimed: std::collections::HashSet<ServerId> =
+            msg.original_aggregate.all_server_ids.iter().copied().collect();
+        if claimed != expected || msg.original_aggregate.all_server_ids.len() != expected.len() {
+            return Err(ProtocolError::MismatchingServers);
+        }
+
         let cur = self.state.lock().unwrap().current_round;
         if msg.original_aggregate.round_number != cur {
             return Err(ProtocolError::WrongRound {
@@ -288,10 +315,6 @@ impl ServerService {
             return Ok(Some(out.clone()));
         }
 
-        if !msg.original_aggregate.all_server_ids.contains(&msg.server_id) {
-            return Err(ProtocolError::InvalidServer(msg.server_id));
-        }
-        let n_servers = msg.original_aggregate.all_server_ids.len();
         // Reject duplicate partials from the same server within a round
         // (collision-detection, prevents one peer from racing another's
         // submission even in the unauthenticated path).
@@ -304,7 +327,7 @@ impl ServerService {
                 slot.insert(msg);
             }
         }
-        if rd.partials.len() < n_servers {
+        if rd.partials.len() < expected.len() {
             return Ok(None);
         }
 
@@ -380,14 +403,6 @@ impl AggregatorService {
         verified: &[VerifiedClientMessage],
     ) -> Result<AggregatedClientMessages, ProtocolError> {
         let mut state = self.state.lock().unwrap();
-        for v in verified {
-            if v.message.round_number != state.current_round {
-                return Err(ProtocolError::WrongRound {
-                    got: v.message.round_number,
-                    expected: state.current_round,
-                });
-            }
-        }
         let authorized = self.authorized.lock().unwrap();
         let m = AggregatorMessager { config: &self.config };
         let agg = m.aggregate_verified_messages(
@@ -543,6 +558,7 @@ impl ClientService {
             &last_bc,
             &message_to_transmit,
             auction_bid.as_ref(),
+            &mut rand::rngs::OsRng,
         )?;
         drop(shared);
 

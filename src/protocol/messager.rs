@@ -3,12 +3,12 @@
 
 use std::collections::HashMap;
 
+use rand::Rng;
 use sha2::{Digest, Sha256};
 
-use crate::auction::auction::{
-    AuctionData, AuctionEngine, AUCTION_BID_XI, AUCTION_HASH_TRUNC_BYTES, AUCTION_KEY_BYTES,
-};
-use crate::auction::iblt::IbltVector;
+use crate::auction::auction::{AuctionData, AuctionEngine, AUCTION_BID_XI, AUCTION_HASH_TRUNC_BYTES};
+use crate::auction::iblt::{iblt_field_element_count, IbltVector};
+use crate::encoders::auction_iblt;
 use crate::crypto::fields::{add_mod_slice, sub_mod_slice};
 use crate::crypto::{
     derive_blinding_vector, derive_xor_blinding_vector, domain_prefixed, xor_inplace, PublicKey,
@@ -55,6 +55,12 @@ impl<'a> ServerMessager<'a> {
         }
         let head = &msgs[0];
         let msg_len = head.message_vector.len();
+        let auction_len = head.original_aggregate.auction_vector.len();
+        if head.auction_vector.len() != auction_len
+            || msg_len != head.original_aggregate.message_vector.len()
+        {
+            return Err(ProtocolError::MismatchingVectorLengths);
+        }
         for m in &msgs[1..] {
             if m.original_aggregate.round_number != head.original_aggregate.round_number
                 || m.original_aggregate.all_server_ids
@@ -66,7 +72,7 @@ impl<'a> ServerMessager<'a> {
             {
                 return Err(ProtocolError::MismatchingAggregate);
             }
-            if m.message_vector.len() != msg_len {
+            if m.message_vector.len() != msg_len || m.auction_vector.len() != auction_len {
                 return Err(ProtocolError::MismatchingVectorLengths);
             }
         }
@@ -176,25 +182,32 @@ impl<'a> AggregatorMessager<'a> {
         if let Some(p) = previous {
             agg.union_inplace(p)?;
         }
-        for v in verified {
-            if !authorized.get(&v.signer.to_hex()).copied().unwrap_or(false) {
-                return Err(ProtocolError::Unauthorized(v.signer.to_hex()));
-            }
-            if v.message.round_number != round {
-                return Err(ProtocolError::WrongRound {
-                    got: v.message.round_number,
-                    expected: round,
-                });
-            }
-        }
-        if verified.is_empty() {
+        // Skip bad messages and replays instead of failing the whole batch.
+        let expected_auction =
+            iblt_field_element_count(self.config.auction_slots, AUCTION_BID_XI);
+        let mut msg_len: Option<usize> =
+            (!agg.message_vector.is_empty()).then(|| agg.message_vector.len());
+        let mut seen: std::collections::HashSet<&PublicKey> = agg.user_pks.iter().collect();
+        let fresh: Vec<&VerifiedClientMessage> = verified
+            .iter()
+            .filter(|v| {
+                v.message.round_number == round
+                    && authorized.get(&v.signer.to_hex()).copied().unwrap_or(false)
+                    && v.message.auction_vector.len() == expected_auction
+                    && *msg_len.get_or_insert(v.message.message_vector.len())
+                        == v.message.message_vector.len()
+                    && seen.insert(&v.signer)
+            })
+            .collect();
+
+        if fresh.is_empty() {
             return Ok(agg);
         }
 
-        let auction_len = verified[0].message.auction_vector.len();
-        let msg_len = verified[0].message.message_vector.len();
-        let server_ids = verified[0].message.all_server_ids.clone();
-        let round_no = verified[0].message.round_number;
+        let auction_len = expected_auction;
+        let msg_len = fresh[0].message.message_vector.len();
+        let server_ids = fresh[0].message.all_server_ids.clone();
+        let round_no = fresh[0].message.round_number;
         let zero = || AggregatedClientMessages {
             round_number: round_no,
             all_server_ids: server_ids.clone(),
@@ -206,7 +219,7 @@ impl<'a> AggregatorMessager<'a> {
         #[cfg(feature = "parallel")]
         let folded = {
             use rayon::prelude::*;
-            verified
+            fresh
                 .par_iter()
                 .fold(zero, |mut acc, v| {
                     add_mod_slice(&mut acc.auction_vector, &v.message.auction_vector);
@@ -222,7 +235,7 @@ impl<'a> AggregatorMessager<'a> {
         #[cfg(not(feature = "parallel"))]
         let folded = {
             let mut acc = zero();
-            for v in verified {
+            for v in &fresh {
                 add_mod_slice(&mut acc.auction_vector, &v.message.auction_vector);
                 xor_inplace(&mut acc.message_vector, &v.message.message_vector);
                 acc.user_pks.push(v.signer.clone());
@@ -302,12 +315,13 @@ impl<'a> ClientMessager<'a> {
 
     /// Build a (still unsigned) ClientRoundMessage for `current_round`.
     /// Returns the message plus whether the client won the previous-round auction.
-    pub fn prepare_message(
+    pub fn prepare_message<R: Rng>(
         &self,
         current_round: i64,
         previous: &RoundBroadcast,
         previous_round_message: &[u8],
         current_round_auction_data: Option<&AuctionData>,
+        rng: &mut R,
     ) -> Result<(ClientRoundMessage, bool), ProtocolError> {
         if previous.round_number + 1 != current_round {
             return Err(ProtocolError::UnknownPreviousRound);
@@ -318,21 +332,7 @@ impl<'a> ClientMessager<'a> {
         let mut auction_iblt =
             IbltVector::new_with_xi(self.config.auction_slots, AUCTION_BID_XI);
         if let Some(ad) = current_round_auction_data {
-            let values = ad.encode_values();
-            let slices: [&[u8]; AUCTION_BID_XI] =
-                [&values[0], &values[1], &values[2], &values[3]];
-            // Deterministic per-round per-client key — uses the current round
-            // number combined with this client's auction bid hash. The
-            // randomness comes from the bid contents; if a client never
-            // re-uses a bid in a round, keys are effectively unique.
-            let mut key = [0u8; AUCTION_KEY_BYTES];
-            let mut h = Sha256::new();
-            h.update(b"adcnet-auction-key");
-            h.update(current_round.to_be_bytes());
-            h.update(ad.message_hash);
-            let digest = h.finalize();
-            key.copy_from_slice(&digest[..AUCTION_KEY_BYTES]);
-            auction_iblt.insert(&key, &slices)?;
+            auction_iblt::insert_bid(&mut auction_iblt, ad, rng)?;
         }
         let auction_elements = auction_iblt.encode_as_field_elements();
 

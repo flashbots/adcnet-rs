@@ -200,6 +200,10 @@ impl IbltVector {
             }
             let key_el = working.keys[ci];
             let key_bytes = to_le_bytes_packed(key_el);
+            // Spurious pure cell (poisoned table) if the key doesn't re-hash here.
+            if chunk_index(&key_bytes, row, working.delta) != col {
+                continue;
+            }
             let mut value_els: Vec<u64> = Vec::with_capacity(working.xi);
             for v in 0..working.xi {
                 value_els.push(working.values[working.value_idx(row, col, v)]);
@@ -337,6 +341,19 @@ mod tests {
         v2.decode_from_elements(&els).unwrap();
         let r = v2.recover().unwrap();
         assert!(r.iter().any(|e| e.key == a));
+
+        // A poisoned pure cell whose key doesn't re-hash to it must stall the
+        // peel, not emit a bogus entry.
+        let kb: [u8; KEY_BYTES] = [9; KEY_BYTES];
+        let home = chunk_index(&kb, 0, v2.delta);
+        let col = (0..v2.delta)
+            .find(|&c| c != home && v2.counters[v2.cell_idx(0, c)] == 0)
+            .unwrap();
+        let ci = v2.cell_idx(0, col);
+        v2.counters[ci] = 1;
+        v2.keys[ci] = from_le_bytes_packed(&kb);
+        let err = v2.recover().unwrap_err();
+        assert!(matches!(err, IbltError::PeelStalled), "got {err:?}");
     }
 
     #[test]

@@ -1,10 +1,11 @@
 //! Adversarial-input tests for [`ServerMessager::unblind_partial_messages`].
 //!
-//! Confirms the four guard conditions added in PR 2:
+//! Confirms the guard conditions:
 //! - Empty `msgs` → `EmptyPartials`.
 //! - Duplicate `server_id` → `DuplicatePartial`.
 //! - Mismatching `original_aggregate` across partials → `MismatchingAggregate`.
-//! - Mismatching `message_vector.len()` → `MismatchingVectorLengths`.
+//! - Mismatching `message_vector.len()` or own `auction_vector.len()` →
+//!   `MismatchingVectorLengths`.
 
 use std::collections::HashMap;
 
@@ -110,6 +111,17 @@ fn mismatching_vector_lengths_errors() {
     let mut p2 = synth_partial(ServerId(2), &agg);
     p2.message_vector = vec![0u8; 32]; // shorter than head's 64
     let mut msgs = vec![p1.clone(), p2.clone()];
+    let err = m.unblind_partial_messages(&mut msgs).unwrap_err();
+    assert!(
+        matches!(err, ProtocolError::MismatchingVectorLengths),
+        "got {err:?}"
+    );
+
+    // A partial's own auction vector shorter than the aggregate's must also
+    // error, not silently truncate the subtraction.
+    p2.message_vector = vec![0u8; 64];
+    p2.auction_vector = vec![0u64; 23];
+    let mut msgs = vec![p1.clone(), p2];
     let err = m.unblind_partial_messages(&mut msgs).unwrap_err();
     assert!(
         matches!(err, ProtocolError::MismatchingVectorLengths),

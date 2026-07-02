@@ -41,6 +41,7 @@ default = []
 parallel = ["dep:rayon"]
 
 [dev-dependencies]
+bincode = "1.3"
 hex-literal = "0.4"
 rand_chacha = "0.3"
 

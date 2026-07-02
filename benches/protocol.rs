@@ -190,9 +190,10 @@ fn stage_client_blind(b: &BenchSetup) -> Duration {
         shared_secrets: &b.client_secrets[0],
     };
     let priv0 = &b.client_priv[0];
+    let mut rng = rand::rngs::OsRng;
     time(10, || {
         let (msg, _) = cm
-            .prepare_message(2, &b.prev_bc, &b.prev_msg, None)
+            .prepare_message(2, &b.prev_bc, &b.prev_msg, None, &mut rng)
             .unwrap();
         let _signed = Signed::new(priv0, msg).unwrap();
     })
@@ -211,7 +212,9 @@ fn signed_batch(b: &BenchSetup) -> Vec<Signed<adcnet::protocol::messages::Client
                 config: &b.config,
                 shared_secrets: &b.client_secrets[c],
             };
-            let (raw, _) = cm.prepare_message(2, &b.prev_bc, prev, None).unwrap();
+            let (raw, _) = cm
+                .prepare_message(2, &b.prev_bc, prev, None, &mut rand::rngs::OsRng)
+                .unwrap();
             Signed::new(&b.client_priv[c], raw).unwrap()
         })
         .collect()

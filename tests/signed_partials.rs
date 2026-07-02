@@ -126,10 +126,13 @@ fn build_fixture() -> Fixture {
 
 fn build_partials(f: &Fixture) -> Vec<adcnet::protocol::messages::ServerPartialDecryptionMessage> {
     let cfg = config();
+    let mut rng = ChaCha20Rng::from_seed([21; 32]);
     // Each client builds + signs its message; each server folds in.
     for c in 0..2 {
         let cm = ClientMessager { config: &cfg, shared_secrets: &f.client_secrets[c] };
-        let (raw, _) = cm.prepare_message(2, &f.prev_bc, &f.msgs_data[c], None).unwrap();
+        let (raw, _) = cm
+            .prepare_message(2, &f.prev_bc, &f.msgs_data[c], None, &mut rng)
+            .unwrap();
         let signed = Signed::new(&f.client_priv[c], raw).unwrap();
         for srv in &f.servers {
             srv.process_client_message(&signed).unwrap();
@@ -174,6 +177,16 @@ fn unknown_peer_rejected() {
         .process_signed_partial_decryption_message(forged)
         .unwrap_err();
     assert!(matches!(err, ProtocolError::UnknownPeerServer(ServerId(99))), "got {err:?}");
+
+    // A registered server truncates `all_server_ids` to just itself, trying to
+    // force an early, unilateral combine over its own partial alone.
+    let mut solo = partials[1].clone();
+    solo.original_aggregate.all_server_ids = vec![ServerId(2)];
+    let forged_solo = f.servers[1].sign_partial(solo).unwrap();
+    let err = leader
+        .process_signed_partial_decryption_message(forged_solo)
+        .unwrap_err();
+    assert!(matches!(err, ProtocolError::MismatchingServers), "got {err:?}");
 }
 
 #[test]
