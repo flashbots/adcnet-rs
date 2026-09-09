@@ -1,10 +1,9 @@
 //! ADCNet — auction-based anonymous DC net.
 //!
-//! Library-shaped: stateless primitives + encoders form the public surface;
-//! reference sessions are composed on top of them.
+//! Use the provided sessions or compose stateless primitives and encoders.
 //!
 //! - [`primitives`]: blinded-broadcast primitives (`field_round`, `xor_round`).
-//! - [`encoders`]: payload encoders (`auction_iblt`, `message_slots`).
+//! - [`encoders`]: payload encoders (`auction_iblt`, `iblt_msg`, `message_slots`).
 //! - [`protocol::session`]: reference sessions composing primitives + encoders.
 //! - [`auction`], [`crypto`], [`protocol`]: low-level building blocks.
 
@@ -14,14 +13,10 @@ pub mod encoders;
 pub mod primitives;
 pub mod protocol;
 
-// --- Library-first public API --------------------------------------------
-
 pub use crate::primitives::{field_round, xor_round};
 pub use crate::encoders::{auction_iblt, iblt_msg, message_slots};
 pub use crate::protocol::envelope::Signed;
 pub use crate::protocol::session;
-
-// --- Re-exports kept for backwards compatibility -------------------------
 
 pub use crate::auction::{AuctionData, AuctionEngine, AuctionWinner, IbltVector};
 pub use crate::crypto::{

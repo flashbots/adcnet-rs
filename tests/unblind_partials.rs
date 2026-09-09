@@ -129,3 +129,51 @@ fn mismatching_vector_lengths_errors() {
     );
     let _ = &mut p1;
 }
+
+#[test]
+fn partials_require_the_complete_roster_and_matching_clients() {
+    let config = cfg();
+    let shared = HashMap::new();
+    let m = make_messager(&config, &shared);
+    let len = adcnet::auction::iblt::iblt_field_element_count(config.auction_slots, 4);
+    let agg = synth_aggregate(7, vec![ServerId(1), ServerId(2)], len);
+    let valid = vec![synth_partial(ServerId(1), &agg), synth_partial(ServerId(2), &agg)];
+    assert!(m.unblind_partial_messages(&mut valid.clone()).is_ok());
+    for mutation in 0..5 {
+        let mut msgs = valid.clone();
+        match mutation {
+            0 => { msgs.pop(); }
+            1 => msgs[1].server_id = ServerId(3),
+            2 => {
+                for msg in &mut msgs {
+                    msg.original_aggregate.all_server_ids = vec![ServerId(1), ServerId(1)];
+                }
+            }
+            3 => msgs[1].original_aggregate.user_pks.push(adcnet::crypto::PublicKey::from_bytes(&[1; 32])),
+            _ => msgs[1].user_pks.push(adcnet::crypto::PublicKey::from_bytes(&[1; 32])),
+        }
+        let error = m.unblind_partial_messages(&mut msgs).unwrap_err();
+        if mutation < 3 {
+            assert!(matches!(error, ProtocolError::MismatchingServers));
+        } else {
+            assert!(matches!(error, ProtocolError::MismatchingAggregate));
+        }
+    }
+}
+
+#[test]
+fn partials_reject_noncanonical_values_before_subtraction() {
+    let config = cfg();
+    let shared = HashMap::new();
+    let m = make_messager(&config, &shared);
+    let len = adcnet::auction::iblt::iblt_field_element_count(config.auction_slots, 4);
+    for value in [adcnet::crypto::fields::P, u64::MAX] {
+        for in_aggregate in [false, true] {
+            let mut agg = synth_aggregate(7, vec![ServerId(1), ServerId(2)], len);
+            if in_aggregate { agg.auction_vector[0] = value; }
+            let mut msgs = vec![synth_partial(ServerId(1), &agg), synth_partial(ServerId(2), &agg)];
+            if !in_aggregate { msgs[1].auction_vector[0] = value; }
+            assert!(matches!(m.unblind_partial_messages(&mut msgs), Err(ProtocolError::NonCanonicalFieldElement)));
+        }
+    }
+}

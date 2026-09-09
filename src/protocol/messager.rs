@@ -69,12 +69,31 @@ impl<'a> ServerMessager<'a> {
                     != head.original_aggregate.auction_vector
                 || m.original_aggregate.message_vector
                     != head.original_aggregate.message_vector
+                || m.original_aggregate.user_pks != head.original_aggregate.user_pks
             {
                 return Err(ProtocolError::MismatchingAggregate);
             }
             if m.message_vector.len() != msg_len || m.auction_vector.len() != auction_len {
                 return Err(ProtocolError::MismatchingVectorLengths);
             }
+        }
+
+        let expected: std::collections::HashSet<_> =
+            head.original_aggregate.all_server_ids.iter().copied().collect();
+        if expected.len() != head.original_aggregate.all_server_ids.len()
+            || msgs.len() != expected.len()
+            || msgs.iter().any(|m| !expected.contains(&m.server_id))
+        {
+            return Err(ProtocolError::MismatchingServers);
+        }
+        if msgs.iter().any(|m| m.user_pks != head.original_aggregate.user_pks) {
+            return Err(ProtocolError::MismatchingAggregate);
+        }
+        if head.original_aggregate.auction_vector.iter()
+            .chain(msgs.iter().flat_map(|m| &m.auction_vector))
+            .any(|&x| x >= crate::crypto::fields::P)
+        {
+            return Err(ProtocolError::NonCanonicalFieldElement);
         }
 
         let mut auction_vector: Vec<u64> = head.original_aggregate.auction_vector.clone();
@@ -111,6 +130,21 @@ impl<'a> ServerMessager<'a> {
         }
         if !aggregate.all_server_ids.contains(&self.server_id) {
             return Err(ProtocolError::InvalidServer(self.server_id));
+        }
+
+        if aggregate.auction_vector.len()
+            != iblt_field_element_count(self.config.auction_slots, AUCTION_BID_XI)
+        {
+            return Err(ProtocolError::MismatchingVectorLengths);
+        }
+        if aggregate.auction_vector.iter().any(|&x| x >= crate::crypto::fields::P) {
+            return Err(ProtocolError::NonCanonicalFieldElement);
+        }
+        let mut seen = std::collections::HashSet::with_capacity(aggregate.user_pks.len());
+        for pk in &aggregate.user_pks {
+            if !seen.insert(pk) {
+                return Err(ProtocolError::DuplicateSubmission(pk.to_hex()));
+            }
         }
 
         let mut auction_secrets: Vec<SharedKey> = Vec::with_capacity(aggregate.user_pks.len());
@@ -185,18 +219,25 @@ impl<'a> AggregatorMessager<'a> {
         // Skip bad messages and replays instead of failing the whole batch.
         let expected_auction =
             iblt_field_element_count(self.config.auction_slots, AUCTION_BID_XI);
-        let mut msg_len: Option<usize> =
-            (!agg.message_vector.is_empty()).then(|| agg.message_vector.len());
+        let mut shape = (!agg.auction_vector.is_empty())
+            .then_some((agg.all_server_ids.as_slice(), agg.message_vector.len()));
         let mut seen: std::collections::HashSet<&PublicKey> = agg.user_pks.iter().collect();
         let fresh: Vec<&VerifiedClientMessage> = verified
             .iter()
             .filter(|v| {
-                v.message.round_number == round
-                    && authorized.get(&v.signer.to_hex()).copied().unwrap_or(false)
-                    && v.message.auction_vector.len() == expected_auction
-                    && *msg_len.get_or_insert(v.message.message_vector.len())
-                        == v.message.message_vector.len()
-                    && seen.insert(&v.signer)
+                if v.message.round_number != round
+                    || !authorized.get(&v.signer.to_hex()).copied().unwrap_or(false)
+                    || v.message.auction_vector.len() != expected_auction
+                    || v.message.auction_vector.iter().any(|&x| x >= crate::crypto::fields::P)
+                {
+                    return false;
+                }
+                let candidate = (v.message.all_server_ids.as_slice(), v.message.message_vector.len());
+                if shape.is_some_and(|expected| expected != candidate) || !seen.insert(&v.signer) {
+                    return false;
+                }
+                shape = Some(candidate);
+                true
             })
             .collect();
 
@@ -279,6 +320,9 @@ impl<'a> ClientMessager<'a> {
         auction_iblt: &IbltVector,
         previous_round_message: &[u8],
     ) -> AuctionResult {
+        if auction_iblt.xi != AUCTION_BID_XI {
+            return AuctionResult::default();
+        }
         let entries = match auction_iblt.recover() {
             Ok(c) => c,
             Err(_) => return AuctionResult::default(),
@@ -397,3 +441,112 @@ impl<'a> ClientMessager<'a> {
     }
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn contribution(config: &AdcNetConfig, client: u8, server: u32) -> VerifiedClientMessage {
+        VerifiedClientMessage {
+            signer: PublicKey::from_bytes(&[client; 32]),
+            message: ClientRoundMessage {
+                round_number: 1,
+                all_server_ids: vec![ServerId(server)],
+                auction_vector: vec![1; iblt_field_element_count(config.auction_slots, AUCTION_BID_XI)],
+                message_vector: Vec::new(),
+            },
+        }
+    }
+
+    fn authorized(messages: &[VerifiedClientMessage]) -> HashMap<String, bool> {
+        messages.iter().map(|m| (m.signer.to_hex(), true)).collect()
+    }
+
+    #[test]
+    fn aggregation_skips_mismatched_rosters_without_consuming_signer() {
+        let config = AdcNetConfig::default();
+        let messager = AggregatorMessager { config: &config };
+        let messages = [
+            contribution(&config, 1, 1),
+            contribution(&config, 2, 2),
+            contribution(&config, 2, 1),
+        ];
+        let agg = messager.aggregate_verified_messages(1, None, &messages, &authorized(&messages)).unwrap();
+        assert_eq!(agg.all_server_ids, vec![ServerId(1)]);
+        assert_eq!(agg.user_pks, vec![messages[0].signer.clone(), messages[2].signer.clone()]);
+        assert!(agg.auction_vector.iter().all(|&x| x == 2));
+    }
+
+    #[test]
+    fn aggregation_preserves_previous_roster_and_empty_message_length() {
+        let config = AdcNetConfig::default();
+        let messager = AggregatorMessager { config: &config };
+        let first = [contribution(&config, 1, 1)];
+        let previous = messager.aggregate_verified_messages(1, None, &first, &authorized(&first)).unwrap();
+        let mut messages = [contribution(&config, 2, 2), contribution(&config, 3, 1), contribution(&config, 4, 1)];
+        messages[1].message.message_vector.push(1);
+        let agg = messager.aggregate_verified_messages(1, Some(&previous), &messages, &authorized(&messages)).unwrap();
+        assert_eq!(agg.user_pks, vec![first[0].signer.clone(), messages[2].signer.clone()]);
+        assert!(agg.message_vector.is_empty());
+        assert!(agg.auction_vector.iter().all(|&x| x == 2));
+    }
+
+    #[test]
+    fn aggregation_skips_noncanonical_values_before_selecting_roster() {
+        let config = AdcNetConfig::default();
+        let messager = AggregatorMessager { config: &config };
+        for value in [crate::crypto::fields::P, u64::MAX] {
+            let mut messages = [contribution(&config, 1, 2), contribution(&config, 1, 1)];
+            messages[0].message.auction_vector[0] = value;
+            let agg = messager.aggregate_verified_messages(1, None, &messages, &authorized(&messages)).unwrap();
+            assert_eq!(agg.all_server_ids, vec![ServerId(1)]);
+            assert_eq!(agg.user_pks, vec![messages[1].signer.clone()]);
+            assert!(agg.auction_vector.iter().all(|&x| x == 1));
+        }
+    }
+    #[test]
+    fn server_rejects_malformed_aggregates_before_deriving_shares() {
+        let config = AdcNetConfig::default();
+        let client = PublicKey::from_bytes(&[1; 32]);
+        let shared = HashMap::from([(client.to_hex(), SharedKey::from_bytes(&[2; 32]))]);
+        let server = ServerMessager { config: &config, server_id: ServerId(1), shared_secrets: &shared };
+        let aggregate = AggregatedClientMessages {
+            round_number: 1,
+            all_server_ids: vec![ServerId(1)],
+            auction_vector: vec![0; iblt_field_element_count(config.auction_slots, AUCTION_BID_XI)],
+            message_vector: vec![],
+            user_pks: vec![client.clone()],
+        };
+        let len = aggregate.auction_vector.len();
+        for bad_len in [0, len - 1, len + 1] {
+            let mut bad = aggregate.clone();
+            bad.auction_vector.resize(bad_len, 0);
+            assert!(matches!(server.unblind_aggregate(1, &bad), Err(ProtocolError::MismatchingVectorLengths)));
+        }
+        for value in [crate::crypto::fields::P, u64::MAX] {
+            let mut bad = aggregate.clone();
+            bad.auction_vector[0] = value;
+            assert!(matches!(server.unblind_aggregate(1, &bad), Err(ProtocolError::NonCanonicalFieldElement)));
+        }
+        let mut duplicate = aggregate.clone();
+        duplicate.user_pks.push(client);
+        assert!(matches!(server.unblind_aggregate(1, &duplicate), Err(ProtocolError::DuplicateSubmission(_))));
+        assert!(server.unblind_aggregate(1, &aggregate).is_ok());
+    }
+
+    #[test]
+    fn previous_auction_rejects_non_bid_layouts() {
+        let config = AdcNetConfig::default();
+        let shared = HashMap::new();
+        let client = ClientMessager { config: &config, shared_secrets: &shared };
+        for xi in [0, 1, 2, 3, 5] {
+            let mut table = IbltVector::new_with_xi(config.auction_slots, xi);
+            let values = vec![&[1u8; 7][..]; xi];
+            table.insert(&[2; 7], &values).unwrap();
+            let result = client.process_previous_auction(&table, b"payload");
+            assert!(!result.should_send);
+            assert_eq!(result.total_allocated, 0);
+        }
+    }
+
+}

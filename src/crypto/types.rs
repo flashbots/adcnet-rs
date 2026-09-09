@@ -32,10 +32,16 @@ impl PublicKey {
     }
 }
 
-/// Ed25519 private key, stored in dalek's 64-byte expanded form `seed || pub`.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+/// Ed25519 keypair bytes, stored as `seed || public_key` (64 bytes).
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct PrivateKey(#[serde(with = "hex_bytes")] pub Vec<u8>);
+
+impl std::fmt::Debug for PrivateKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PrivateKey([REDACTED])")
+    }
+}
 
 impl PrivateKey {
     pub fn from_bytes(b: &[u8]) -> Self {
@@ -118,27 +124,16 @@ pub fn public_key_to_server_id(pk: &PublicKey) -> ServerId {
     ServerId(if id == 0 { 1 } else { id })
 }
 
-/// Maps server IDs to integer x-coordinates (1-indexed rank within the sorted
-/// round ID set) for polynomial evaluation. `0` marks an ID not in `round_sids`.
-pub fn server_ids_to_x_evals(round_sids: &[ServerId], available_sids: &[ServerId]) -> Vec<u64> {
-    let mut ordered = round_sids.to_vec();
-    ordered.sort();
-    let mut res = vec![0u64; available_sids.len()];
-    for (j, id1) in ordered.iter().enumerate() {
-        for (k, id2) in available_sids.iter().enumerate() {
-            if id1 == id2 {
-                res[k] = (j + 1) as u64;
-                break;
-            }
-        }
-    }
-    res
-}
-
 /// Symmetric DH shared secret used to derive blinding vectors.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct SharedKey(#[serde(with = "hex_bytes")] pub Vec<u8>);
+
+impl std::fmt::Debug for SharedKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SharedKey([REDACTED])")
+    }
+}
 
 impl SharedKey {
     pub fn from_bytes(b: &[u8]) -> Self {
@@ -201,7 +196,7 @@ pub enum KeyError {
 mod hex_bytes {
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-    pub fn serialize<S: Serializer>(v: &Vec<u8>, s: S) -> Result<S::Ok, S::Error> {
+    pub fn serialize<S: Serializer>(v: &[u8], s: S) -> Result<S::Ok, S::Error> {
         if s.is_human_readable() {
             s.serialize_str(&hex::encode(v))
         } else {
@@ -240,4 +235,15 @@ mod tests {
         let ba = b.ecdh(&a.public());
         assert_eq!(ab.as_bytes(), ba.as_bytes());
     }
+
+    #[test]
+    fn secret_debug_output_is_redacted() {
+        let private = PrivateKey::from_bytes(&[42; 64]);
+        let shared = SharedKey::from_bytes(&[43; 32]);
+        assert_eq!(format!("{private:?}"), "PrivateKey([REDACTED])");
+        assert_eq!(format!("{private:#?}"), "PrivateKey([REDACTED])");
+        assert_eq!(format!("{shared:?}"), "SharedKey([REDACTED])");
+        assert_eq!(format!("{shared:#?}"), "SharedKey([REDACTED])");
+    }
+
 }

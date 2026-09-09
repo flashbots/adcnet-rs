@@ -32,7 +32,12 @@ pub fn server_share(secrets: &[SharedKey], round: u32, len: usize) -> Vec<u8> {
 /// With the `parallel` feature, `sources.len() >= 2 · n_threads` triggers a
 /// `par_chunks` split: each chunk produces one partial XOR accumulator
 /// (bounded `n_threads + 1` allocations), reducing predictably.
+///
+/// # Panics
+/// Panics before modifying `dst` if any source length differs from `dst.len()`.
 pub fn aggregate_clients_into(dst: &mut [u8], sources: &[&[u8]]) {
+    assert!(sources.iter().all(|s| s.len() == dst.len()),
+        "xor_round::aggregate_clients length mismatch");
     if sources.is_empty() {
         return;
     }
@@ -40,13 +45,12 @@ pub fn aggregate_clients_into(dst: &mut [u8], sources: &[&[u8]]) {
     {
         let n_threads = rayon::current_num_threads().max(1);
         if sources.len() >= 2 * n_threads {
-            let chunk_size = (sources.len() + n_threads - 1) / n_threads;
+            let chunk_size = sources.len().div_ceil(n_threads);
             let partials: Vec<Vec<u8>> = sources
                 .par_chunks(chunk_size)
                 .map(|chunk| {
                     let mut acc = vec![0u8; dst.len()];
                     for c in chunk {
-                        debug_assert_eq!(c.len(), dst.len());
                         xor_inplace(&mut acc, c);
                     }
                     acc
@@ -59,7 +63,6 @@ pub fn aggregate_clients_into(dst: &mut [u8], sources: &[&[u8]]) {
         }
     }
     for c in sources {
-        debug_assert_eq!(c.len(), dst.len(), "xor_round::aggregate_clients length mismatch");
         xor_inplace(dst, c);
     }
 }
@@ -76,14 +79,14 @@ pub fn aggregate_clients(sources: &[&[u8]]) -> Vec<u8> {
 
 /// XOR all server shares into the aggregate to recover the plaintext XOR-sum
 /// of all client contributions.
+///
+/// # Panics
+/// Panics if any share length differs from `agg.len()`.
 pub fn combine_partials(agg: &[u8], partials: &[&[u8]]) -> Vec<u8> {
+    assert!(partials.iter().all(|p| p.len() == agg.len()),
+        "xor_round::combine_partials length mismatch");
     let mut out = agg.to_vec();
     for p in partials {
-        debug_assert_eq!(
-            p.len(),
-            out.len(),
-            "xor_round::combine_partials length mismatch"
-        );
         xor_inplace(&mut out, p);
     }
     out
@@ -146,4 +149,31 @@ mod tests {
         let field_bytes = field_pad[0].to_le_bytes();
         assert_ne!(&xor_pad[..7], &field_bytes[..7]);
     }
+    #[test]
+    fn aggregate_rejects_mismatched_lengths_before_mutating() {
+        for count in [2, 16] {
+            for bad_len in [0, 3, 5] {
+                let mut sources = vec![vec![1; 4]; count];
+                sources[count - 1] = vec![1; bad_len];
+                let slices: Vec<_> = sources.iter().map(Vec::as_slice).collect();
+                let mut dst = vec![7; 4];
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    aggregate_clients_into(&mut dst, &slices);
+                }));
+                assert!(result.is_err());
+                assert_eq!(dst, vec![7; 4]);
+            }
+        }
+    }
+
+    #[test]
+    fn combine_rejects_mismatched_lengths() {
+        for bad_len in [0, 3, 5] {
+            let bad = vec![1; bad_len];
+            assert!(std::panic::catch_unwind(|| {
+                combine_partials(&[7; 4], &[&[1; 4], &bad]);
+            }).is_err());
+        }
+    }
+
 }

@@ -70,6 +70,8 @@ pub enum OneRoundError {
     Protocol(#[from] crate::protocol::messages::ProtocolError),
     #[error("server share count mismatch: expected {expected}, got {got}")]
     ServerShareCount { expected: usize, got: usize },
+    #[error("non-canonical field element in contribution")]
+    NonCanonicalFieldElement,
     #[error("inconsistent round: contribution claims {got}, expected {expected}")]
     WrongRound { got: u32, expected: u32 },
 }
@@ -166,11 +168,21 @@ pub fn combine_round(
             });
         }
     }
+    let params = cfg.iblt.as_params();
+    let len = params.encoded_len();
+    for vector in clients.iter().map(|c| &c.blinded).chain(servers.iter().map(|s| &s.share)) {
+        if vector.len() != len {
+            return Err(crate::protocol::messages::ProtocolError::MismatchingVectorLengths.into());
+        }
+        if vector.iter().any(|&x| x >= crate::crypto::fields::P) {
+            return Err(OneRoundError::NonCanonicalFieldElement);
+        }
+    }
     let blinded_slices: Vec<&[u64]> = clients.iter().map(|c| c.blinded.as_slice()).collect();
-    let agg = field_round::aggregate_clients(&blinded_slices);
+    let mut agg = vec![0; len];
+    field_round::aggregate_clients_into(&mut agg, &blinded_slices);
     let share_slices: Vec<&[u64]> = servers.iter().map(|s| s.share.as_slice()).collect();
     let recovered = field_round::combine_partials(&agg, &share_slices);
-    let params = cfg.iblt.as_params();
     Ok(decode_round(&params, &recovered)?)
 }
 
@@ -317,4 +329,54 @@ mod tests {
             "got {err:?}"
         );
     }
+
+    #[test]
+    fn combine_rejects_invalid_vectors() {
+        use crate::protocol::messages::ProtocolError;
+        use crate::crypto::fields::P;
+
+        let cfg = config(32, 2);
+        let len = cfg.iblt.as_params().encoded_len();
+        let client = ClientContribution { round: 7, blinded: vec![0; len] };
+        let server = ServerShare { server_id: ServerId(1), round: 7, share: vec![0; len] };
+        for bad_len in [0, len - 1, len + 1] {
+            let mut bad_client = client.clone();
+            bad_client.blinded.resize(bad_len, 0);
+            assert!(matches!(
+                combine_round(&cfg, 7, &[bad_client], std::slice::from_ref(&server), 1),
+                Err(OneRoundError::Protocol(ProtocolError::MismatchingVectorLengths))
+            ));
+            let mut bad_server = server.clone();
+            bad_server.share.resize(bad_len, 0);
+            assert!(matches!(
+                combine_round(&cfg, 7, std::slice::from_ref(&client), &[bad_server], 1),
+                Err(OneRoundError::Protocol(ProtocolError::MismatchingVectorLengths))
+            ));
+        }
+        for value in [P, u64::MAX] {
+            let mut bad_client = client.clone();
+            bad_client.blinded[0] = value;
+            assert!(matches!(
+                combine_round(&cfg, 7, &[bad_client], std::slice::from_ref(&server), 1),
+                Err(OneRoundError::NonCanonicalFieldElement)
+            ));
+            let mut bad_server = server.clone();
+            bad_server.share[0] = value;
+            assert!(matches!(
+                combine_round(&cfg, 7, std::slice::from_ref(&client), &[bad_server], 1),
+                Err(OneRoundError::NonCanonicalFieldElement)
+            ));
+        }
+    }
+
+    #[test]
+    fn combine_empty_client_set() {
+        let cfg = config(32, 2);
+        let server = ServerShare {
+            server_id: ServerId(1), round: 7,
+            share: vec![0; cfg.iblt.as_params().encoded_len()],
+        };
+        assert!(combine_round(&cfg, 7, &[], &[server], 1).unwrap().is_empty());
+    }
+
 }

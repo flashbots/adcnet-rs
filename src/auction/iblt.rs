@@ -23,25 +23,18 @@
 //! modular addition, so an IBLT aggregates across clients using the
 //! field-additive blinded-broadcast primitive.
 
+use negacyclic_rings::ntt64::{add_mod, sub_mod};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-use crate::crypto::fields::{add_assign_mod, from_le_bytes_packed, sub_assign_mod, to_le_bytes_packed, PACK_BYTES};
+use crate::crypto::fields::{from_le_bytes_packed, to_le_bytes_packed, P, PACK_BYTES};
 
-/// Number of rows in the IBLT. Fixed at 4 — the per-row peeling-probability
-/// bound is `(load_factor)^(γ-2)`, so γ ≥ 2 is required and γ = 4 gives the
-/// standard ~2.5× headroom margin at `IBLT_LOAD_FACTOR`.
+/// Number of rows in the IBLT.
 pub const IBLT_GAMMA: usize = 4;
 
-/// Buckets per row = `⌈IBLT_LOAD_FACTOR · n⌉` where `n` is the expected
-/// element count. Load factor is **per row** (not total), so
-/// `total_cells = γ · LOAD_FACTOR · n`.
-///
-/// For γ=4 the asymptotic peelability threshold (Eppstein–Goodrich–
-/// Mitzenmacher) is `δ ≥ 1.295 · n`. We pick `1.5` for ~15% headroom over
-/// that limit — generous enough to absorb expected variance in `N` without
-/// inflating IBLT size more than needed.
+/// Buckets per row = `max(1, ⌈IBLT_LOAD_FACTOR · n⌉)` for `n` expected entries.
+/// Total cells = `IBLT_GAMMA · buckets_per_row`.
 pub const IBLT_LOAD_FACTOR: f64 = 1.5;
 
 /// Bytes per IBLT key (one field element packed).
@@ -130,10 +123,10 @@ impl IbltVector {
             let col = chunk_index(key, row, self.delta);
             let ci = self.cell_idx(row, col);
             self.counters[ci] += 1;
-            add_assign_mod(&mut self.keys[ci], key_el);
+            self.keys[ci] = add_mod(self.keys[ci], key_el, P);
             for (v, &el) in value_els.iter().enumerate() {
                 let vi = self.value_idx(row, col, v);
-                add_assign_mod(&mut self.values[vi], el);
+                self.values[vi] = add_mod(self.values[vi], el, P);
             }
         }
         Ok(())
@@ -157,16 +150,32 @@ impl IbltVector {
         out
     }
 
-    /// Inverse of [`Self::encode_as_field_elements`]. Verifies length; errors
-    /// if the slice length disagrees with the IBLT's shape.
+    fn validate_shape(&self) -> Result<usize, IbltError> {
+        let cells = self.gamma.checked_mul(self.delta).ok_or(IbltError::InvalidShape)?;
+        let values = cells.checked_mul(self.xi).ok_or(IbltError::InvalidShape)?;
+        if self.gamma != IBLT_GAMMA || self.delta != iblt_delta(self.estimated_elements)
+            || self.counters.len() != cells || self.keys.len() != cells
+            || self.values.len() != values
+        {
+            return Err(IbltError::InvalidShape);
+        }
+        cells.checked_mul(2).and_then(|n| n.checked_add(values))
+            .ok_or(IbltError::InvalidShape)
+    }
+
+    /// Inverse of [`Self::encode_as_field_elements`]. Validates the table shape,
+    /// input length, and canonical field values before modifying the table.
     pub fn decode_from_elements(&mut self, elements: &[u64]) -> Result<&mut Self, IbltError> {
-        let n_cells = self.gamma * self.delta;
-        let expected = n_cells * (2 + self.xi);
+        let expected = self.validate_shape()?;
+        let n_cells = self.counters.len();
         if elements.len() != expected {
             return Err(IbltError::FieldElementCountMismatch {
                 expected,
                 got: elements.len(),
             });
+        }
+        if elements.iter().any(|&x| x >= P) {
+            return Err(IbltError::NonCanonicalFieldElement);
         }
         self.counters.copy_from_slice(&elements[..n_cells]);
         self.keys.copy_from_slice(&elements[n_cells..2 * n_cells]);
@@ -178,6 +187,10 @@ impl IbltVector {
     /// arrival order. Errors if any cell remains non-zero after peeling
     /// drains.
     pub fn recover(&self) -> Result<Vec<RecoveredEntry>, IbltError> {
+        self.validate_shape()?;
+        if self.counters.iter().chain(&self.keys).chain(&self.values).any(|&x| x >= P) {
+            return Err(IbltError::NonCanonicalFieldElement);
+        }
         let mut working = self.clone();
         let mut recovered: Vec<RecoveredEntry> = Vec::new();
         let mut queue: Vec<(usize, usize)> = Vec::new();
@@ -199,6 +212,9 @@ impl IbltVector {
                 continue;
             }
             let key_el = working.keys[ci];
+            if key_el >= (1u64 << (PACK_BYTES * 8)) {
+                return Err(IbltError::InvalidPackedElement);
+            }
             let key_bytes = to_le_bytes_packed(key_el);
             // Spurious pure cell (poisoned table) if the key doesn't re-hash here.
             if chunk_index(&key_bytes, row, working.delta) != col {
@@ -207,6 +223,9 @@ impl IbltVector {
             let mut value_els: Vec<u64> = Vec::with_capacity(working.xi);
             for v in 0..working.xi {
                 value_els.push(working.values[working.value_idx(row, col, v)]);
+            }
+            if value_els.iter().any(|&x| x >= (1u64 << (PACK_BYTES * 8))) {
+                return Err(IbltError::InvalidPackedElement);
             }
             let value_bytes: Vec<Vec<u8>> = value_els
                 .iter()
@@ -223,10 +242,10 @@ impl IbltVector {
                 if working.counters[ici] == 0 {
                     return Err(IbltError::UnexpectedZeroCounter);
                 }
-                sub_assign_mod(&mut working.keys[ici], key_el);
+                working.keys[ici] = sub_mod(working.keys[ici], key_el, P);
                 for (v, &el) in value_els.iter().enumerate() {
                     let ivi = working.value_idx(inner_row, inner_col, v);
-                    sub_assign_mod(&mut working.values[ivi], el);
+                    working.values[ivi] = sub_mod(working.values[ivi], el, P);
                 }
                 working.counters[ici] -= 1;
                 if working.counters[ici] == 1 {
@@ -235,7 +254,7 @@ impl IbltVector {
             }
         }
 
-        for &c in &working.counters {
+        for &c in working.counters.iter().chain(&working.keys).chain(&working.values) {
             if c != 0 {
                 return Err(IbltError::PeelStalled);
             }
@@ -267,6 +286,12 @@ pub fn chunk_index(chunk: &[u8; KEY_BYTES], row: usize, delta: usize) -> usize {
 
 #[derive(Debug, Error)]
 pub enum IbltError {
+    #[error("invalid IBLT shape")]
+    InvalidShape,
+    #[error("non-canonical field element in IBLT")]
+    NonCanonicalFieldElement,
+    #[error("recovered field element exceeds the seven-byte packing limit")]
+    InvalidPackedElement,
     #[error("unexpected zero counter while recovering IBLT")]
     UnexpectedZeroCounter,
     #[error("peeling stalled: cells remain non-zero with no pure cell")]
@@ -371,4 +396,83 @@ mod tests {
         let err = v.insert(&key, &[&v0]).unwrap_err();
         assert!(matches!(err, IbltError::PayloadArity { expected: 2, got: 1 }));
     }
+
+    #[test]
+    fn recover_rejects_residual_keys_and_values() {
+        for with_entry in [false, true] {
+            let mut table = IbltVector::new_with_xi(2, 1);
+            if with_entry {
+                table.insert(&[1; KEY_BYTES], &[&[2; PACK_BYTES]]).unwrap();
+            }
+            let empty_cell = table.counters.iter().position(|&c| c == 0).unwrap();
+            let mut bad_key = table.clone();
+            bad_key.keys[empty_cell] = 1;
+            assert!(matches!(bad_key.recover(), Err(IbltError::PeelStalled)));
+            table.values[empty_cell] = 1;
+            assert!(matches!(table.recover(), Err(IbltError::PeelStalled)));
+        }
+    }
+
+    #[test]
+    fn recover_rejects_unrepresentable_pure_cells() {
+        let mut table = IbltVector::new_with_xi(2, 1);
+        table.insert(&[1; KEY_BYTES], &[&[2; PACK_BYTES]]).unwrap();
+        for value in [1u64 << (PACK_BYTES * 8), crate::crypto::fields::P - 1] {
+            let mut bad_key = table.clone();
+            let mut bad_value = table.clone();
+            for (i, &count) in table.counters.iter().enumerate() {
+                if count == 1 {
+                    bad_key.keys[i] = value;
+                    bad_value.values[i] = value;
+                }
+            }
+            assert!(matches!(bad_key.recover(), Err(IbltError::InvalidPackedElement)));
+            assert!(matches!(bad_value.recover(), Err(IbltError::InvalidPackedElement)));
+        }
+    }
+
+    #[test]
+    fn malformed_shapes_are_rejected() {
+        let table = IbltVector::new_with_xi(2, 1);
+        for mutation in 0..8 {
+            let mut bad = table.clone();
+            match mutation {
+                0 => bad.gamma = 0,
+                1 => bad.delta = 0,
+                2 => bad.gamma = usize::MAX,
+                3 => bad.xi = usize::MAX,
+                4 => bad.estimated_elements += 1,
+                5 => bad.counters.clear(),
+                6 => bad.keys.clear(),
+                _ => bad.values.clear(),
+            }
+            assert!(matches!(bad.recover(), Err(IbltError::InvalidShape)));
+            assert!(matches!(bad.decode_from_elements(&[]), Err(IbltError::InvalidShape)));
+        }
+    }
+
+    #[test]
+    fn noncanonical_values_are_rejected_before_decode_mutates() {
+        let mut table = IbltVector::new_with_xi(2, 1);
+        table.insert(&[1; KEY_BYTES], &[&[2; PACK_BYTES]]).unwrap();
+        let before = table.encode_as_field_elements();
+        for index in [0, table.counters.len(), 2 * table.counters.len()] {
+            for value in [P, u64::MAX] {
+                let mut bad = before.clone();
+                bad[index] = value;
+                assert!(matches!(table.decode_from_elements(&bad), Err(IbltError::NonCanonicalFieldElement)));
+                assert_eq!(table.encode_as_field_elements(), before);
+            }
+        }
+        for component in 0..3 {
+            let mut bad = table.clone();
+            match component {
+                0 => bad.counters[0] = P,
+                1 => bad.keys[0] = P,
+                _ => bad.values[0] = P,
+            }
+            assert!(matches!(bad.recover(), Err(IbltError::NonCanonicalFieldElement)));
+        }
+    }
+
 }

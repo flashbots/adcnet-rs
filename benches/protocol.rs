@@ -33,7 +33,8 @@ use std::time::{Duration, Instant};
 
 use adcnet::auction::auction::{AuctionData, AUCTION_BID_XI};
 use adcnet::auction::iblt::IbltVector;
-use adcnet::crypto::fields::add_assign_mod;
+use adcnet::crypto::fields::P;
+use negacyclic_rings::ntt64::add_mod;
 use adcnet::crypto::types::{generate_keypair, ExchangePrivateKey};
 use adcnet::crypto::SharedKey;
 use adcnet::encoders::auction_iblt;
@@ -254,7 +255,7 @@ fn stage_batch_aggregate(
                 .fold(zero, |mut acc, m| {
                     let (raw, signer) = m.recover().unwrap();
                     for (a, &b) in acc.auction_vector.iter_mut().zip(raw.auction_vector.iter()) {
-                        add_assign_mod(a, b);
+                        *a = add_mod(*a, b, P);
                     }
                     adcnet::crypto::xor_inplace(&mut acc.message_vector, &raw.message_vector);
                     acc.user_pks.push(signer.clone());
@@ -271,7 +272,7 @@ fn stage_batch_aggregate(
             for m in batch {
                 let (raw, signer) = m.recover().unwrap();
                 for (a, &b) in acc.auction_vector.iter_mut().zip(raw.auction_vector.iter()) {
-                    add_assign_mod(a, b);
+                    *a = add_mod(*a, b, P);
                 }
                 adcnet::crypto::xor_inplace(&mut acc.message_vector, &raw.message_vector);
                 acc.user_pks.push(signer.clone());
@@ -302,7 +303,7 @@ fn stage_batch_unblind(
     for m in batch {
         let (raw, signer) = m.recover().unwrap();
         for (a, &b) in agg.auction_vector.iter_mut().zip(raw.auction_vector.iter()) {
-            add_assign_mod(a, b);
+            *a = add_mod(*a, b, P);
         }
         adcnet::crypto::xor_inplace(&mut agg.message_vector, &raw.message_vector);
         agg.user_pks.push(signer.clone());
@@ -334,7 +335,7 @@ fn stage_leader_combine(
     for m in batch {
         let (raw, signer) = m.recover().unwrap();
         for (a, &b) in agg.auction_vector.iter_mut().zip(raw.auction_vector.iter()) {
-            add_assign_mod(a, b);
+            *a = add_mod(*a, b, P);
         }
         adcnet::crypto::xor_inplace(&mut agg.message_vector, &raw.message_vector);
         agg.user_pks.push(signer.clone());
@@ -397,7 +398,7 @@ fn measure_wires(
     for m in batch {
         let (raw, signer) = m.recover().unwrap();
         for (a, &v) in agg.auction_vector.iter_mut().zip(raw.auction_vector.iter()) {
-            add_assign_mod(a, v);
+            *a = add_mod(*a, v, P);
         }
         adcnet::crypto::xor_inplace(&mut agg.message_vector, &raw.message_vector);
         agg.user_pks.push(signer.clone());

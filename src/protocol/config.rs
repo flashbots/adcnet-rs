@@ -2,10 +2,6 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use crate::auction::iblt::iblt_field_element_count;
-use crate::auction::auction::AUCTION_BID_XI;
-use crate::crypto::fields::WIRE_BYTES;
-
 /// Whether the protocol uses the optional aggregator layer. When `Disabled`,
 /// clients submit signed round messages directly to servers.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -22,7 +18,6 @@ pub struct AdcNetConfig {
     pub min_clients: u32,
     #[serde(with = "humantime_serde", default = "default_round")]
     pub round_duration: Duration,
-    pub rounds_per_window: u32,
     #[serde(default)]
     pub aggregation: AggregationMode,
 }
@@ -38,15 +33,9 @@ impl Default for AdcNetConfig {
             message_length: 0,
             min_clients: 1,
             round_duration: default_round(),
-            rounds_per_window: 0,
             aggregation: AggregationMode::Enabled,
         }
     }
-}
-
-/// Byte size of the encoded auction-IBLT field-element vector on the wire.
-pub fn auction_slots_for_config(c: &AdcNetConfig) -> u32 {
-    (iblt_field_element_count(c.auction_slots, AUCTION_BID_XI) * WIRE_BYTES) as u32
 }
 
 /// Result of running the auction over the previous round's IBLT.

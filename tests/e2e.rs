@@ -1,10 +1,6 @@
 //! End-to-end protocol smoke tests.
 //!
-//! Mirrors `protocol/protocol_test.go::TestE2E`: 3 clients, 3 servers, no
-//! aggregator (we drive the messager objects directly), confirms two scheduled
-//! messages survive a round of blind/aggregate/unblind. The second test runs the
-//! same scenario through the optional [`AggregationMode::Disabled`] path on
-//! [`ServerService`].
+//! Covers message recovery through the messager, aggregator, and direct-server paths.
 
 use std::collections::HashMap;
 

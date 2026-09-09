@@ -1,62 +1,19 @@
 //! Field arithmetic over `F_p`, `p = 0x1eeed4e13a526bab`.
 //!
-//! `p` is a 61-bit prime drawn at random (via `secrets.randbelow` + sympy's
-//! `nextprime`); it satisfies `2·p < 2^64` so additions over `u64` can never
-//! overflow before reduction, and `p > 2^56` so any 7-byte LE input is
-//! automatically `< p` (lossless `from_le_bytes_packed`).
-//!
-//! All field elements are bare `u64` values held in `[0, p)`. There is no
-//! newtype wrapper — every operation is a free function. The IBLT, the
-//! field-additive blinded-broadcast primitive, and every encoder use this
-//! field; security analysis is in the crate-level docs.
+//! Field elements are `u64` values in `[0, p)`. Since `2·p < 2^64`, adding
+//! canonical elements cannot overflow. Since `2^56 < p`, any 7-byte input
+//! packs losslessly into one element.
+
+use negacyclic_rings::ntt64::{add_mod, sub_mod};
 
 /// Prime modulus.
 pub const P: u64 = 0x1eeed4e13a526bab;
 
-/// Bytes packed per field element on the data side (inputs/outputs of the
-/// IBLT and payload encoders). 7 B → values in `[0, 2^56) ⊂ [0, p)`, so
-/// the byte→field→byte roundtrip is lossless for any 7-byte input.
+/// Bytes packed per field element by the IBLT and payload encoders.
 pub const PACK_BYTES: usize = 7;
 
-/// Bytes per field element on the wire (counter, key, V slot serialization).
-/// Full LE `u64`. Some values `∈ [p, 2^64)` are unreachable but that does not
-/// affect roundtripping of canonical elements.
+/// Bytes per field element on the wire, encoded as a little-endian `u64`.
 pub const WIRE_BYTES: usize = 8;
-
-/// `(a + b) mod p`. `a` and `b` must each be `< p`; result is `< p`.
-#[inline]
-pub fn add_mod(a: u64, b: u64) -> u64 {
-    debug_assert!(a < P && b < P);
-    let s = a + b; // < 2·p < 2^64
-    if s >= P {
-        s - P
-    } else {
-        s
-    }
-}
-
-/// `(a - b) mod p`. `a` and `b` must each be `< p`; result is `< p`.
-#[inline]
-pub fn sub_mod(a: u64, b: u64) -> u64 {
-    debug_assert!(a < P && b < P);
-    if a >= b {
-        a - b
-    } else {
-        a + P - b
-    }
-}
-
-/// In-place `*a = (*a + b) mod p`.
-#[inline]
-pub fn add_assign_mod(a: &mut u64, b: u64) {
-    *a = add_mod(*a, b);
-}
-
-/// In-place `*a = (*a - b) mod p`.
-#[inline]
-pub fn sub_assign_mod(a: &mut u64, b: u64) {
-    *a = sub_mod(*a, b);
-}
 
 /// Decode up to `PACK_BYTES` little-endian bytes into a field element. The
 /// resulting value is `< 2^56 < p`, so no reduction is needed.
@@ -92,14 +49,10 @@ pub fn to_le_bytes_wire(x: u64) -> [u8; WIRE_BYTES] {
     x.to_le_bytes()
 }
 
-/// Reduce a `u64` mod p (canonicalize). Cheap conditional subtract.
+/// Reduce any `u64` modulo p.
 #[inline]
 pub fn reduce(x: u64) -> u64 {
-    if x >= P {
-        x - P
-    } else {
-        x
-    }
+    x % P
 }
 
 // --- Vector helpers --------------------------------------------------------
@@ -121,13 +74,12 @@ pub fn add_mod_slice(dst: &mut [u64], src: &[u64]) {
         }
     }
     for i in 0..n {
-        add_assign_mod(&mut dst[i], src[i]);
+        dst[i] = add_mod(dst[i], src[i], P);
     }
 }
 
-/// `dst[i] = (dst[i] - src[i]) mod p`. Same SIMD strategy as
-/// [`add_mod_slice`] but with the underflow-correction `if d < a then d + p`
-/// pattern.
+/// `dst[i] = (dst[i] - src[i]) mod p` for `i in 0..min(dst.len(), src.len())`.
+/// Uses the same SIMD strategy as [`add_mod_slice`].
 #[inline]
 pub fn sub_mod_slice(dst: &mut [u64], src: &[u64]) {
     let n = dst.len().min(src.len());
@@ -139,7 +91,7 @@ pub fn sub_mod_slice(dst: &mut [u64], src: &[u64]) {
         }
     }
     for i in 0..n {
-        sub_assign_mod(&mut dst[i], src[i]);
+        dst[i] = sub_mod(dst[i], src[i], P);
     }
 }
 
@@ -170,7 +122,7 @@ unsafe fn add_mod_slice_avx2(dst: &mut [u64], src: &[u64]) {
         i += 4;
     }
     while i < n {
-        add_assign_mod(&mut *dp.add(i), *sp.add(i));
+        *dp.add(i) = add_mod(*dp.add(i), *sp.add(i), P);
         i += 1;
     }
 }
@@ -200,7 +152,7 @@ unsafe fn sub_mod_slice_avx2(dst: &mut [u64], src: &[u64]) {
         i += 4;
     }
     while i < n {
-        sub_assign_mod(&mut *dp.add(i), *sp.add(i));
+        *dp.add(i) = sub_mod(*dp.add(i), *sp.add(i), P);
         i += 1;
     }
 }
@@ -216,14 +168,14 @@ mod tests {
 
     #[test]
     fn add_wraps() {
-        assert_eq!(add_mod(P - 1, 1), 0);
-        assert_eq!(add_mod(P - 1, P - 1), P - 2);
+        assert_eq!(add_mod(P - 1, 1, P), 0);
+        assert_eq!(add_mod(P - 1, P - 1, P), P - 2);
     }
 
     #[test]
     fn sub_wraps() {
-        assert_eq!(sub_mod(0, 1), P - 1);
-        assert_eq!(sub_mod(3, 5), P - 2);
+        assert_eq!(sub_mod(0, 1, P), P - 1);
+        assert_eq!(sub_mod(3, 5, P), P - 2);
     }
 
     #[test]
@@ -251,7 +203,7 @@ mod tests {
             add_mod_slice(&mut got, &b);
             let mut want = a.clone();
             for i in 0..n {
-                add_assign_mod(&mut want[i], b[i]);
+                want[i] = add_mod(want[i], b[i], P);
             }
             assert_eq!(got, want, "n={}", n);
         }
@@ -266,7 +218,7 @@ mod tests {
             sub_mod_slice(&mut got, &b);
             let mut want = a.clone();
             for i in 0..n {
-                sub_assign_mod(&mut want[i], b[i]);
+                want[i] = sub_mod(want[i], b[i], P);
             }
             assert_eq!(got, want, "n={}", n);
         }
@@ -299,4 +251,27 @@ mod tests {
         sub_mod_slice(&mut got, &b);
         assert_eq!(got, vec![P - 1; n]);
     }
+
+    #[test]
+    fn reduce_handles_the_full_u64_range() {
+        for (input, expected) in [
+            (0, 0), (P - 1, P - 1), (P, 0),
+            (2 * P - 1, P - 1), (2 * P, 0),
+            (u64::MAX, 0x88958f62d6ca2a7),
+        ] {
+            assert_eq!(reduce(input), expected);
+        }
+    }
+    #[test]
+    fn scalar_arithmetic_matches_wide_reference() {
+        for a in [0, 1, 2, P / 2, P - 2, P - 1] {
+            for b in [0, 1, 2, P / 2, P - 2, P - 1] {
+                let expected_add = ((a as u128 + b as u128) % P as u128) as u64;
+                let expected_sub = ((a as u128 + P as u128 - b as u128) % P as u128) as u64;
+                assert_eq!(add_mod(a, b, P), expected_add);
+                assert_eq!(sub_mod(a, b, P), expected_sub);
+            }
+        }
+    }
+
 }

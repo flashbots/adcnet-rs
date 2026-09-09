@@ -139,6 +139,10 @@ impl ServerService {
         msg: &Signed<ClientRoundMessage>,
     ) -> Result<(), ProtocolError> {
         let (raw, signer) = msg.recover()?;
+        let signer_id = signer.to_hex();
+        if !self.shared_secrets.lock().unwrap().contains_key(&signer_id) {
+            return Err(ProtocolError::NoSharedKey(signer_id));
+        }
         let mut state = self.state.lock().unwrap();
         let cur = state.current_round;
         let rd = state.round.as_mut().ok_or(ProtocolError::ClientNotInitialized)?;
@@ -150,6 +154,10 @@ impl ServerService {
             != iblt_field_element_count(self.config.auction_slots, AUCTION_BID_XI)
         {
             return Err(ProtocolError::MismatchingVectorLengths);
+        }
+
+        if raw.auction_vector.iter().any(|&x| x >= crate::crypto::fields::P) {
+            return Err(ProtocolError::NonCanonicalFieldElement);
         }
 
         // Lazy-init the aggregate's owned buffers on the first message.
@@ -169,7 +177,7 @@ impl ServerService {
         {
             return Err(ProtocolError::MismatchingVectorLengths);
         }
-        if agg.user_pks.contains(&signer) {
+        if agg.user_pks.contains(signer) {
             return Err(ProtocolError::DuplicateSubmission(signer.to_hex()));
         }
 
@@ -568,5 +576,47 @@ impl ClientService {
 
     pub fn process_round_broadcast(&self, rb: RoundBroadcast) {
         self.state.lock().unwrap().last_broadcast = Some(rb);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::crypto::{fields::P, generate_keypair};
+    use crate::protocol::RoundContext;
+
+    #[test]
+    fn direct_messages_validate_registration_and_field_values_before_mutating() {
+        let config = AdcNetConfig::default();
+        let len = iblt_field_element_count(config.auction_slots, AUCTION_BID_XI);
+        let server = ServerService::new(config, ServerId(1), generate_keypair().1,
+            ExchangePrivateKey::generate());
+        server.advance_to_round(Round::new(1, RoundContext::Client));
+        let (pk, sk) = generate_keypair();
+        let raw = ClientRoundMessage {
+            round_number: 1,
+            all_server_ids: vec![ServerId(1)],
+            auction_vector: vec![0; len],
+            message_vector: vec![0; 4],
+        };
+        let signed = Signed::new(&sk, raw.clone()).unwrap();
+        assert!(matches!(server.process_client_message(&signed), Err(ProtocolError::NoSharedKey(_))));
+        assert!(server.state.lock().unwrap().round.as_ref().unwrap().direct_aggregate.is_none());
+        server.register_client(&pk, &ExchangePrivateKey::generate().public()).unwrap();
+        for value in [P, u64::MAX] {
+            let mut bad = raw.clone();
+            bad.auction_vector[0] = value;
+            let signed_bad = Signed::new(&sk, bad).unwrap();
+            assert!(matches!(server.process_client_message(&signed_bad), Err(ProtocolError::NonCanonicalFieldElement)));
+            assert!(server.state.lock().unwrap().round.as_ref().unwrap().direct_aggregate.is_none());
+        }
+        server.process_client_message(&signed).unwrap();
+        server.deregister_client(&pk);
+        assert!(matches!(server.process_client_message(&signed), Err(ProtocolError::NoSharedKey(_))));
+        let state = server.state.lock().unwrap();
+        let aggregate = state.round.as_ref().unwrap().direct_aggregate.as_ref().unwrap();
+        assert_eq!(aggregate.user_pks, vec![pk]);
+        assert_eq!(aggregate.auction_vector, raw.auction_vector);
+        assert_eq!(aggregate.message_vector, raw.message_vector);
     }
 }

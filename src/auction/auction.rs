@@ -8,10 +8,8 @@ use crate::crypto::fields::PACK_BYTES;
 use super::iblt::KEY_BYTES;
 
 /// Knapsack granularity in bytes. Bids round their size up to the next
-/// multiple of this constant before the DP runs, so the DP table is sized as
-/// `total_bandwidth / KNAPSACK_CHUNK_BYTES` columns rather than per-byte.
-/// At 1 KiB chunks, a `total_bandwidth` of 1 MiB needs a 1024-entry DP row
-/// (vs ~1 M entries previously).
+/// multiple of this constant before the DP runs. Each DP row has
+/// `total_bandwidth / KNAPSACK_CHUNK_BYTES + 1` entries.
 pub const KNAPSACK_CHUNK_BYTES: u32 = 1024;
 
 /// A client's bid: weight (utility), message size in bytes, and a SHA-256-derived
@@ -31,8 +29,7 @@ pub struct AuctionData {
 /// - `V[2]`: message_hash[0..7]
 /// - `V[3]`: message_hash[7..14]
 ///
-/// Only the first 14 bytes of the SHA-256 hash are carried. 112-bit collision
-/// resistance is comfortable for any realistic round (N < 2^40).
+/// Only the first 14 bytes of the SHA-256 hash are carried.
 pub const AUCTION_BID_XI: usize = 4;
 
 /// Bytes of `message_hash` actually transmitted (= `2 × PACK_BYTES`).
@@ -117,8 +114,8 @@ impl AuctionEngine {
         Self::with_chunk_bytes(total_bandwidth, min_message_size, KNAPSACK_CHUNK_BYTES)
     }
 
-    /// Construct with an explicit quantization granularity. Use `chunk_bytes = 1`
-    /// to match the legacy per-byte DP (only practical for tiny `total_bandwidth`).
+    /// Construct with an explicit quantization granularity. `chunk_bytes = 1`
+    /// gives byte-level allocation at a higher memory cost.
     pub fn with_chunk_bytes(total_bandwidth: u32, min_message_size: u32, chunk_bytes: u32) -> Self {
         assert!(chunk_bytes > 0, "chunk_bytes must be positive");
         Self { total_bandwidth, min_message_size, chunk_bytes }
@@ -172,7 +169,7 @@ impl AuctionEngine {
         let row_words = (cap + 1).div_ceil(64);
         // `keep[i * row_words + word]` holds the bits for item `i`.
         let mut keep: Vec<u64> = vec![0u64; n * row_words];
-        let mut dp = vec![0u32; cap + 1];
+        let mut dp = vec![0u64; cap + 1];
 
         for (i, &(bid, chunks)) in bids.iter().enumerate() {
             let size = chunks as usize;
@@ -181,15 +178,13 @@ impl AuctionEngine {
             }
             // Iterate `w` from `cap` down to `size` so each item is used at most
             // once (standard 0/1 knapsack pattern).
-            let mut w = cap;
-            while w >= size {
-                let include_value = dp[w - size] + bid.weight;
+            for w in (size..=cap).rev() {
+                let include_value = dp[w - size] + u64::from(bid.weight);
                 if include_value > dp[w] {
                     dp[w] = include_value;
                     let bit_idx = i * row_words * 64 + w;
                     keep[bit_idx / 64] |= 1u64 << (bit_idx % 64);
                 }
-                w -= 1;
             }
         }
 
@@ -216,7 +211,7 @@ impl AuctionEngine {
                 });
             }
         }
-        winners.sort_by(|a, b| a.bid.message_hash.cmp(&b.bid.message_hash));
+        winners.sort_by_key(|w| w.bid.message_hash);
         winners
     }
 }
@@ -319,4 +314,35 @@ mod tests {
         // Only the first 14 bytes of the hash are preserved.
         assert_eq!(&b.message_hash[..14], &a.message_hash[..14]);
     }
+
+    #[test]
+    fn knapsack_handles_total_weight_above_u32() {
+        let engine = AuctionEngine::with_chunk_bytes(2, 1, 1);
+        let bids = [
+            AuctionData { message_hash: [1; 32], weight: u32::MAX, size: 2 },
+            AuctionData { message_hash: [2; 32], weight: u32::MAX - 1, size: 1 },
+            AuctionData { message_hash: [3; 32], weight: u32::MAX - 1, size: 1 },
+        ];
+        let winners = engine.run_auction(&bids);
+        let selected: Vec<_> = winners.iter().map(|w| w.bid.message_hash[0]).collect();
+        assert_eq!(selected, vec![2, 3]);
+        assert_eq!(winners.iter().map(|w| u64::from(w.bid.weight)).sum::<u64>(),
+            2 * u64::from(u32::MAX - 1));
+    }
+
+    #[test]
+    fn knapsack_handles_zero_size_bids() {
+        let engine = AuctionEngine::with_chunk_bytes(1, 0, 1);
+        let bids = [
+            AuctionData { message_hash: [1; 32], weight: 2, size: 0 },
+            AuctionData { message_hash: [2; 32], weight: 3, size: 1 },
+            AuctionData { message_hash: [3; 32], weight: 4, size: 0 },
+        ];
+        let winners = engine.run_auction(&bids);
+        let selected: Vec<_> = winners.iter().map(|w| w.bid.message_hash[0]).collect();
+        assert_eq!(selected, vec![1, 2, 3]);
+        assert_eq!(winners.iter().map(|w| w.slot_size).sum::<u32>(), 1);
+        assert_eq!(winners.iter().map(|w| w.bid.weight).sum::<u32>(), 9);
+    }
+
 }

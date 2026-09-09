@@ -14,7 +14,7 @@
 //! ```
 //!
 //! `ξ = ⌈(max_payload_bytes + 4) / PACK_BYTES⌉` covers any payload up to
-//! `max_payload_bytes`. Usable bytes per insert = `ξ · PACK_BYTES − 4`.
+//! `max_payload_bytes`. Storage capacity per insert = `ξ · PACK_BYTES − 4`.
 
 use rand::Rng;
 use thiserror::Error;
@@ -38,7 +38,7 @@ impl IbltMsgParams {
         (self.max_payload_bytes + LENGTH_PREFIX_BYTES).div_ceil(PACK_BYTES)
     }
 
-    /// Usable payload bytes per insert.
+    /// Rounded storage capacity; the configured payload limit may be smaller.
     pub fn usable_payload_bytes(&self) -> usize {
         self.xi() * PACK_BYTES - LENGTH_PREFIX_BYTES
     }
@@ -71,10 +71,10 @@ pub fn encode_payload<R: Rng>(
     payload: &[u8],
     rng: &mut R,
 ) -> Result<Vec<u64>, IbltMsgError> {
-    if payload.len() > params.usable_payload_bytes() {
+    if payload.len() > params.max_payload_bytes {
         return Err(IbltMsgError::PayloadTooLarge {
             got: payload.len(),
-            usable: params.usable_payload_bytes(),
+            usable: params.max_payload_bytes,
         });
     }
 
@@ -124,10 +124,10 @@ fn unframe(params: &IbltMsgParams, e: RecoveredEntry) -> Result<Vec<u8>, IbltMsg
         });
     }
     let length = u32::from_be_bytes([flat[0], flat[1], flat[2], flat[3]]) as usize;
-    if length > params.usable_payload_bytes() {
+    if length > params.max_payload_bytes {
         return Err(IbltMsgError::BadFraming {
             claimed: length,
-            capacity: params.usable_payload_bytes(),
+            capacity: params.max_payload_bytes,
         });
     }
     Ok(flat[LENGTH_PREFIX_BYTES..LENGTH_PREFIX_BYTES + length].to_vec())
@@ -210,4 +210,37 @@ mod tests {
         let decoded = decode_round(&p, &agg).unwrap();
         assert_eq!(decoded, vec![payload]);
     }
+
+    #[test]
+    fn encode_enforces_configured_payload_limit() {
+        let mut rng = ChaCha20Rng::from_seed([5; 32]);
+        for limit in [0, 1, 3, 4, 16, 64] {
+            let p = params(limit, 4);
+            let payload = vec![42; limit];
+            let encoded = encode_payload(&p, &payload, &mut rng).unwrap();
+            assert_eq!(decode_round(&p, &encoded).unwrap(), vec![payload]);
+            assert!(matches!(
+                encode_payload(&p, &vec![42; limit + 1], &mut rng),
+                Err(IbltMsgError::PayloadTooLarge { got, usable })
+                    if got == limit + 1 && usable == limit
+            ));
+        }
+    }
+
+    #[test]
+    fn decode_rejects_payload_in_rounding_slack() {
+        let mut rng = ChaCha20Rng::from_seed([6; 32]);
+        for limit in [0, 1, 4, 16, 64] {
+            let p = params(limit, 4);
+            let sender = params(p.usable_payload_bytes(), 4);
+            assert_eq!(sender.xi(), p.xi());
+            let encoded = encode_payload(&sender, &vec![42; limit + 1], &mut rng).unwrap();
+            assert!(matches!(
+                decode_round(&p, &encoded),
+                Err(IbltMsgError::BadFraming { claimed, capacity })
+                    if claimed == limit + 1 && capacity == limit
+            ));
+        }
+    }
+
 }

@@ -9,7 +9,7 @@ pub mod round;
 pub mod services;
 pub mod session;
 
-pub use config::{auction_slots_for_config, AdcNetConfig, AggregationMode, AuctionResult};
+pub use config::{AdcNetConfig, AggregationMode, AuctionResult};
 pub use messages::{
     AggregatedClientMessages, ClientRoundMessage, ProtocolError, RoundBroadcast,
     ServerPartialDecryptionMessage, Signed,

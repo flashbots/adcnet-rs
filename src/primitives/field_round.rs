@@ -34,7 +34,12 @@ pub fn server_share(secrets: &[SharedKey], round: u32, len: usize) -> Vec<u64> {
 /// `n_threads + 1` allocations per call), then partial accumulators reduce
 /// sequentially into `dst`. Predictable allocation profile vs rayon's
 /// fold-induced per-task accumulators.
+///
+/// # Panics
+/// Panics before modifying `dst` if any source length differs from `dst.len()`.
 pub fn aggregate_clients_into(dst: &mut [u64], sources: &[&[u64]]) {
+    assert!(sources.iter().all(|s| s.len() == dst.len()),
+        "field_round::aggregate_clients length mismatch");
     if sources.is_empty() {
         return;
     }
@@ -42,13 +47,12 @@ pub fn aggregate_clients_into(dst: &mut [u64], sources: &[&[u64]]) {
     {
         let n_threads = rayon::current_num_threads().max(1);
         if sources.len() >= 2 * n_threads {
-            let chunk_size = (sources.len() + n_threads - 1) / n_threads;
+            let chunk_size = sources.len().div_ceil(n_threads);
             let partials: Vec<Vec<u64>> = sources
                 .par_chunks(chunk_size)
                 .map(|chunk| {
                     let mut acc = vec![0u64; dst.len()];
                     for c in chunk {
-                        debug_assert_eq!(c.len(), dst.len());
                         add_mod_slice(&mut acc, c);
                     }
                     acc
@@ -61,7 +65,6 @@ pub fn aggregate_clients_into(dst: &mut [u64], sources: &[&[u64]]) {
         }
     }
     for c in sources {
-        debug_assert_eq!(c.len(), dst.len(), "field_round::aggregate_clients length mismatch");
         add_mod_slice(dst, c);
     }
 }
@@ -78,13 +81,13 @@ pub fn aggregate_clients(sources: &[&[u64]]) -> Vec<u64> {
 
 /// Subtract every server share from `dst` (mod p). Caller supplies `dst`
 /// already populated with the aggregate.
+///
+/// # Panics
+/// Panics before modifying `dst` if any share length differs from `dst.len()`.
 pub fn combine_partials_into(dst: &mut [u64], partials: &[&[u64]]) {
+    assert!(partials.iter().all(|p| p.len() == dst.len()),
+        "field_round::combine_partials length mismatch");
     for p in partials {
-        debug_assert_eq!(
-            p.len(),
-            dst.len(),
-            "field_round::combine_partials length mismatch"
-        );
         sub_mod_slice(dst, p);
     }
 }
@@ -130,7 +133,8 @@ mod tests {
 
     #[test]
     fn two_clients_two_servers_roundtrip() {
-        use crate::crypto::fields::add_mod;
+        use negacyclic_rings::ntt64::add_mod;
+        use crate::crypto::fields::P;
 
         let c1s1 = shared("c1s1");
         let c1s2 = shared("c1s2");
@@ -149,7 +153,37 @@ mod tests {
         let s2 = server_share(&[c1s2, c2s2], 3, len);
         let recovered = combine_partials(&agg, &[&s1, &s2]);
 
-        let expected: Vec<u64> = c1.iter().zip(c2.iter()).map(|(&a, &b)| add_mod(a, b)).collect();
+        let expected: Vec<u64> = c1.iter().zip(c2.iter()).map(|(&a, &b)| add_mod(a, b, P)).collect();
         assert_eq!(recovered, expected);
     }
+    #[test]
+    fn aggregate_rejects_mismatched_lengths_before_mutating() {
+        for count in [2, 16] {
+            for bad_len in [0, 3, 5] {
+                let mut sources = vec![vec![1; 4]; count];
+                sources[count - 1] = vec![1; bad_len];
+                let slices: Vec<_> = sources.iter().map(Vec::as_slice).collect();
+                let mut dst = vec![7; 4];
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    aggregate_clients_into(&mut dst, &slices);
+                }));
+                assert!(result.is_err());
+                assert_eq!(dst, vec![7; 4]);
+            }
+        }
+    }
+
+    #[test]
+    fn combine_rejects_mismatched_lengths_before_mutating() {
+        for bad_len in [0, 3, 5] {
+            let mut dst = vec![7; 4];
+            let bad = vec![1; bad_len];
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                combine_partials_into(&mut dst, &[&[1; 4], &bad]);
+            }));
+            assert!(result.is_err());
+            assert_eq!(dst, vec![7; 4]);
+        }
+    }
+
 }

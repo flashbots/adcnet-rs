@@ -44,7 +44,7 @@ pub fn read_slots(vec: &[u8], winners: &[AuctionWinner]) -> Vec<Vec<u8>> {
         .iter()
         .map(|w| {
             let start = w.slot_idx as usize;
-            let end = (start + w.slot_size as usize).min(vec.len());
+            let end = start.saturating_add(w.slot_size as usize).min(vec.len());
             if start >= vec.len() {
                 Vec::new()
             } else {
@@ -86,4 +86,14 @@ mod tests {
         let err = write_slot(&mut buf, 6, b"too long").unwrap_err();
         assert!(matches!(err, SlotError::Overflow { .. }));
     }
+    #[test]
+    fn read_truncates_oversized_slots() {
+        let winners: Vec<_> = [1, 4, u32::MAX].into_iter().map(|slot_idx| AuctionWinner {
+            bid: AuctionData { message_hash: [0; 32], weight: 1, size: 1 },
+            slot_idx,
+            slot_size: u32::MAX,
+        }).collect();
+        assert_eq!(read_slots(b"data", &winners), vec![b"ata".to_vec(), vec![], vec![]]);
+    }
+
 }

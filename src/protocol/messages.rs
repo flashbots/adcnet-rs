@@ -1,15 +1,18 @@
 //! Wire-level message types and the generic [`Signed<T>`] envelope.
 
+use negacyclic_rings::ntt64::sub_mod;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::crypto::{
-    fields::{add_mod_slice, sub_assign_mod},
+    fields::{add_mod_slice, P},
     sign, verify, xor_inplace, KeyError, PrivateKey, PublicKey, ServerId, Signature,
 };
 
 #[derive(Debug, Error)]
 pub enum ProtocolError {
+    #[error("non-canonical field element")]
+    NonCanonicalFieldElement,
     #[error("signature not valid")]
     BadSignature,
     #[error("mismatching rounds")]
@@ -62,16 +65,12 @@ impl ProtocolError {
     }
 }
 
-/// Avoid `Vec<u64>` length-prefixed serde overhead by transporting the
-/// vector as raw bytes (`8 · N` LE). Pub so session-level wire types can
-/// reuse it.
+/// Serialize field vectors as little-endian bytes (`8 · N` bytes).
 pub mod u64_vec_bytes {
     use crate::crypto::fields::P;
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-    // `&Vec<u64>` (not `&[u64]`) is required by serde's `with` field binding.
-    #[allow(clippy::ptr_arg)]
-    pub fn serialize<S: Serializer>(v: &Vec<u64>, s: S) -> Result<S::Ok, S::Error> {
+    pub fn serialize<S: Serializer>(v: &[u64], s: S) -> Result<S::Ok, S::Error> {
         let mut bytes = vec![0u8; v.len() * 8];
         for (i, &x) in v.iter().enumerate() {
             bytes[i * 8..(i + 1) * 8].copy_from_slice(&x.to_le_bytes());
@@ -180,33 +179,37 @@ impl AggregatedClientMessages {
 
     /// Field-add the auction vectors, XOR the message vectors, and concatenate user PK lists.
     pub fn union_inplace(&mut self, o: &AggregatedClientMessages) -> Result<(), ProtocolError> {
-        if self.round_number == 0 {
-            self.round_number = o.round_number;
-        } else if self.round_number != o.round_number {
-            return Err(ProtocolError::MismatchingRounds);
+        let empty = self.all_server_ids.is_empty()
+            && self.auction_vector.is_empty()
+            && self.message_vector.is_empty()
+            && self.user_pks.is_empty();
+        if !empty {
+            if self.round_number != o.round_number {
+                return Err(ProtocolError::MismatchingRounds);
+            }
+            if self.all_server_ids != o.all_server_ids {
+                return Err(ProtocolError::MismatchingServers);
+            }
+            if self.auction_vector.len() != o.auction_vector.len()
+                || self.message_vector.len() != o.message_vector.len()
+            {
+                return Err(ProtocolError::MismatchingVectorLengths);
+            }
         }
-
-        if self.all_server_ids.is_empty() {
-            self.all_server_ids = o.all_server_ids.clone();
-        } else if self.all_server_ids != o.all_server_ids {
-            return Err(ProtocolError::MismatchingServers);
+        let mut seen = std::collections::HashSet::new();
+        for pk in self.user_pks.iter().chain(&o.user_pks) {
+            if !seen.insert(pk) {
+                return Err(ProtocolError::DuplicateSubmission(pk.to_hex()));
+            }
         }
-
-        if self.auction_vector.is_empty() {
-            self.auction_vector = vec![0u64; o.auction_vector.len()];
-        }
-        if self.message_vector.is_empty() {
-            self.message_vector = vec![0u8; o.message_vector.len()];
-        }
-        if self.auction_vector.len() != o.auction_vector.len()
-            || self.message_vector.len() != o.message_vector.len()
+        if self.auction_vector.iter().chain(&o.auction_vector)
+            .any(|&x| x >= crate::crypto::fields::P)
         {
-            return Err(ProtocolError::MismatchingVectorLengths);
+            return Err(ProtocolError::NonCanonicalFieldElement);
         }
-
-        let existing: std::collections::HashSet<&PublicKey> = self.user_pks.iter().collect();
-        if let Some(dup) = o.user_pks.iter().find(|pk| existing.contains(pk)) {
-            return Err(ProtocolError::DuplicateSubmission(dup.to_hex()));
+        if empty {
+            *self = o.clone();
+            return Ok(());
         }
 
         add_mod_slice(&mut self.auction_vector, &o.auction_vector);
@@ -240,6 +243,77 @@ pub struct RoundBroadcast {
 /// [`AggregatedClientMessages::union_inplace`]'s add semantics.
 pub fn sub_assign_field(a: &mut [u64], b: &[u64]) {
     for (x, &y) in a.iter_mut().zip(b.iter()) {
-        sub_assign_mod(x, y);
+        *x = sub_mod(*x, y, P);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::crypto::fields::P;
+
+    fn batch(round: i64, client: u8) -> AggregatedClientMessages {
+        AggregatedClientMessages {
+            round_number: round,
+            all_server_ids: vec![ServerId(1)],
+            auction_vector: vec![1, 2],
+            message_vector: vec![3, 4],
+            user_pks: vec![PublicKey::from_bytes(&[client; 32])],
+        }
+    }
+
+    #[test]
+    fn union_preserves_round_zero_and_combines_vectors() {
+        let mut a = AggregatedClientMessages::empty();
+        let mut b = batch(0, 1);
+        b.auction_vector[0] = P - 1;
+        a.union_inplace(&b).unwrap();
+        assert_eq!(bincode::serialize(&a).unwrap(), bincode::serialize(&b).unwrap());
+        a.union_inplace(&batch(0, 2)).unwrap();
+        assert_eq!(a.round_number, 0);
+        assert_eq!(a.auction_vector, vec![0, 4]);
+        assert_eq!(a.message_vector, vec![0, 0]);
+        assert_eq!(a.user_pks.len(), 2);
+        let before = bincode::serialize(&a).unwrap();
+        assert!(matches!(a.union_inplace(&batch(1, 3)), Err(ProtocolError::MismatchingRounds)));
+        assert_eq!(bincode::serialize(&a).unwrap(), before);
+    }
+
+    #[test]
+    fn union_rejects_duplicate_members_without_mutation() {
+        for mut a in [AggregatedClientMessages::empty(), batch(1, 1)] {
+            let mut b = batch(1, 2);
+            b.user_pks.push(b.user_pks[0].clone());
+            let before = bincode::serialize(&a).unwrap();
+            assert!(matches!(a.union_inplace(&b), Err(ProtocolError::DuplicateSubmission(_))));
+            assert_eq!(bincode::serialize(&a).unwrap(), before);
+        }
+        let mut a = batch(1, 1);
+        let before = bincode::serialize(&a).unwrap();
+        assert!(matches!(a.union_inplace(&batch(1, 1)), Err(ProtocolError::DuplicateSubmission(_))));
+        assert_eq!(bincode::serialize(&a).unwrap(), before);
+    }
+
+    #[test]
+    fn union_rejects_invalid_shapes_and_elements_without_mutation() {
+        for case in 0..5 {
+            let mut a = batch(1, 1);
+            let mut b = batch(1, 2);
+            match case {
+                0 => b.all_server_ids.push(ServerId(2)),
+                1 => b.auction_vector.clear(),
+                2 => a.message_vector.clear(),
+                3 => b.auction_vector[0] = P,
+                _ => a.auction_vector[0] = u64::MAX,
+            }
+            let before = bincode::serialize(&a).unwrap();
+            let error = a.union_inplace(&b).unwrap_err();
+            match case {
+                0 => assert!(matches!(error, ProtocolError::MismatchingServers)),
+                1 | 2 => assert!(matches!(error, ProtocolError::MismatchingVectorLengths)),
+                _ => assert!(matches!(error, ProtocolError::NonCanonicalFieldElement)),
+            }
+            assert_eq!(bincode::serialize(&a).unwrap(), before);
+        }
     }
 }

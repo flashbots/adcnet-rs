@@ -6,9 +6,8 @@
 //!   aggregator.
 //! - [`one_round`]: scheduling-free IBLT-message flow.
 //!
-//! These are *examples* of how to compose the library. Downstream consumers
-//! that want different transport, scheduling, or threading should build their
-//! own session by calling the primitives and encoders directly.
+//! Use these sessions for the provided protocol flows, or compose primitives
+//! and encoders for a custom flow. Callers supply transport and scheduling.
 //!
 //! [`primitives`]: crate::primitives
 //! [`encoders`]: crate::encoders
